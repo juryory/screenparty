@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>ScreenParty · 开黑同屏</title>
+<link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+
+<!-- 加入界面 -->
+<section id="lobby" class="lobby">
+  <div class="lobby-card">
+    <div class="brand">
+      <span class="brand-dot" aria-hidden="true"></span>
+      <h1>ScreenParty</h1>
+      <p class="brand-sub">多人同屏 · 语音开黑 · P2P 直连</p>
+    </div>
+    <label for="nameInput">你的昵称</label>
+    <input id="nameInput" maxlength="24" placeholder="例如:老张" autocomplete="off" />
+    <label for="roomInput">房间名</label>
+    <input id="roomInput" maxlength="32" placeholder="和朋友约定同一个房间名" autocomplete="off" />
+    <button id="joinBtn" class="btn-primary">进入房间</button>
+    <p id="lobbyError" class="lobby-error" hidden></p>
+    <p class="lobby-hint">进入后浏览器会请求麦克风权限。画面与声音在成员之间点对点传输,不经过服务器。</p>
+  </div>
+</section>
+
+<!-- 房间界面 -->
+<section id="room" class="room" hidden>
+  <header class="topbar">
+    <div class="topbar-room">
+      <span class="brand-dot" aria-hidden="true"></span>
+      <span id="roomLabel" class="room-name"></span>
+      <button id="copyLinkBtn" class="btn-ghost" title="复制房间链接">复制邀请链接</button>
+    </div>
+    <ul id="memberList" class="members" aria-label="房间成员"></ul>
+  </header>
+
+  <main id="grid" class="grid" data-count="0">
+    <div id="emptyState" class="empty">
+      <p>还没有人在共享画面</p>
+      <p class="empty-sub">点击下方「共享屏幕」,把你的游戏画面播给大家</p>
+    </div>
+  </main>
+
+  <footer class="console">
+    <button id="micBtn" class="ctl" aria-pressed="true">
+      <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path fill="currentColor" d="M12 14a3 3 0 0 0 3-3V6a3 3 0 1 0-6 0v5a3 3 0 0 0 3 3Zm5-3a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.92V21h2v-3.08A7 7 0 0 0 19 11h-2Z"/></svg>
+      <span>麦克风</span>
+    </button>
+    <button id="shareBtn" class="ctl ctl-share" aria-pressed="false">
+      <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path fill="currentColor" d="M4 5h16a1 1 0 0 1 1 1v10a1 1 0 0 1-1 1h-6v2h3v2H7v-2h3v-2H4a1 1 0 0 1-1-1V6a1 1 0 0 1 1-1Zm1 2v8h14V7H5Z"/></svg>
+      <span>共享屏幕</span>
+    </button>
+    <button id="leaveBtn" class="ctl ctl-leave">
+      <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path fill="currentColor" d="M10 4h9a1 1 0 0 1 1 1v14a1 1 0 0 1-1 1h-9v-2h8V6h-8V4Zm-1.5 4.5L4 12l4.5 3.5v-2.5H14v-2H8.5V8.5Z"/></svg>
+      <span>离开</span>
+    </button>
+  </footer>
+</section>
+
+<template id="tileTemplate">
+  <figure class="tile">
+    <video playsinline autoplay></video>
+    <div class="tile-stats" aria-hidden="true"></div>
+    <figcaption class="umd">
+      <span class="umd-name"></span>
+      <span class="umd-tally">ON AIR</span>
+    </figcaption>
+  </figure>
+</template>
+
+<script src="/app.js"></script>
+</body>
+</html>

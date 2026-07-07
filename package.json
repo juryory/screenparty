@@ -1,0 +1,15 @@
+{
+  "name": "screenparty",
+  "version": "1.0.0",
+  "private": true,
+  "description": "多人同时共享屏幕 + 语音的自托管网页工具(WebRTC mesh + Cloudflare Worker 信令)",
+  "scripts": {
+    "dev": "wrangler dev",
+    "start": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "check": "wrangler deploy --dry-run"
+  },
+  "devDependencies": {
+    "wrangler": "^4.108.0"
+  }
+}

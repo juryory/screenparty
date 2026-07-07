@@ -1,0 +1,20 @@
+{
+  "name": "screenparty",
+  "main": "src/index.js",
+  "compatibility_date": "2026-06-01",
+  "assets": {
+    "directory": "./public",
+    "binding": "ASSETS"
+  },
+  "durable_objects": {
+    "bindings": [{ "name": "ROOM", "class_name": "Room" }]
+  },
+  "migrations": [
+    // SQLite-backed DO:Workers 免费计划即可使用
+    { "tag": "v1", "new_sqlite_classes": ["Room"] }
+  ]
+  // 可选:接入 Cloudflare Realtime TURN 作打洞失败兜底
+  // 在 dashboard 创建 TURN key 后执行:
+  //   wrangler secret put TURN_KEY_ID
+  //   wrangler secret put TURN_KEY_API_TOKEN
+}
