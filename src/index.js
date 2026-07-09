@@ -1,10 +1,28 @@
 // ScreenParty — 信令服务 (Cloudflare Worker + Durable Object)
 // 媒体流走 WebRTC mesh 点对点传输,本服务只负责:
 //   1. /ws/:room   房间信令 (join / signal 转发 / 成员状态广播)
-//   2. /api/turn   可选:签发 Cloudflare Realtime TURN 临时凭证
+//   2. /api/turn   可选:签发 TURN 临时凭证(自建 coturn / Cloudflare Realtime)
 //   3. 其余路径    静态前端 (public/)
 
 const MAX_PEERS = 8;
+
+// coturn REST API 临时凭证(use-auth-secret 模式):
+//   username   = 过期时间戳(unix 秒),coturn 会校验其未过期
+//   credential = base64( HMAC-SHA1(static-auth-secret, username) )
+// 凭证会过期,即使被抓包也无法长期盗用中继带宽。
+async function coturnCredential(secret, ttlSeconds = 86400) {
+  const username = String(Math.floor(Date.now() / 1000) + ttlSeconds);
+  const key = await crypto.subtle.importKey(
+    'raw',
+    new TextEncoder().encode(secret),
+    { name: 'HMAC', hash: 'SHA-1' },
+    false,
+    ['sign'],
+  );
+  const sig = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(username));
+  const credential = btoa(String.fromCharCode(...new Uint8Array(sig)));
+  return { username, credential };
+}
 
 export default {
   async fetch(request, env) {
@@ -29,36 +47,59 @@ export default {
   },
 
   async turnCredentials(env) {
-    const fallback = {
-      iceServers: [
-        { urls: 'stun:stun.cloudflare.com:3478' },
-        { urls: 'stun:stun.l.google.com:19302' },
-      ],
-    };
-    if (!env.TURN_KEY_ID || !env.TURN_KEY_API_TOKEN) {
-      return Response.json(fallback);
+    // STUN 永远放最前:让浏览器优先尝试 P2P 直连,连不上才回落到 TURN 中继
+    const iceServers = [
+      { urls: 'stun:stun.cloudflare.com:3478' },
+      { urls: 'stun:stun.l.google.com:19302' },
+    ];
+
+    // ① 自建 coturn(如腾讯云 VPS):配置 COTURN_HOST + COTURN_SECRET 即启用
+    if (env.COTURN_HOST && env.COTURN_SECRET) {
+      try {
+        const { username, credential } = await coturnCredential(env.COTURN_SECRET);
+        const host = env.COTURN_HOST; // 域名或公网 IP,不含端口
+        const port = env.COTURN_PORT || '3478';
+        iceServers.push(
+          { urls: `turn:${host}:${port}?transport=udp`, username, credential },
+          { urls: `turn:${host}:${port}?transport=tcp`, username, credential },
+        );
+        // 有 TLS 证书时再暴露 turns://(走 443/5349,穿透只放行 HTTPS 的严格网络)
+        if (env.COTURN_TLS_HOST) {
+          const tlsPort = env.COTURN_TLS_PORT || '5349';
+          iceServers.push({
+            urls: `turns:${env.COTURN_TLS_HOST}:${tlsPort}?transport=tcp`,
+            username,
+            credential,
+          });
+        }
+      } catch (e) {
+        console.error('coturn credential error:', e.message);
+      }
     }
-    try {
-      const r = await fetch(
-        `https://rtc.live.cloudflare.com/v1/turn/keys/${env.TURN_KEY_ID}/credentials/generate-ice-servers`,
-        {
-          method: 'POST',
-          headers: {
-            Authorization: `Bearer ${env.TURN_KEY_API_TOKEN}`,
-            'Content-Type': 'application/json',
+
+    // ② Cloudflare Realtime TURN(可选,与自建可并存;境外节点,国内延迟略高)
+    if (env.TURN_KEY_ID && env.TURN_KEY_API_TOKEN) {
+      try {
+        const r = await fetch(
+          `https://rtc.live.cloudflare.com/v1/turn/keys/${env.TURN_KEY_ID}/credentials/generate-ice-servers`,
+          {
+            method: 'POST',
+            headers: {
+              Authorization: `Bearer ${env.TURN_KEY_API_TOKEN}`,
+              'Content-Type': 'application/json',
+            },
+            body: JSON.stringify({ ttl: 86400 }),
           },
-          body: JSON.stringify({ ttl: 86400 }),
-        },
-      );
-      if (!r.ok) throw new Error(`turn api ${r.status}`);
-      const data = await r.json();
-      // 把 STUN 也带上,优先直连
-      data.iceServers = [...fallback.iceServers, ...[].concat(data.iceServers)];
-      return Response.json(data);
-    } catch (e) {
-      console.error('TURN credential error:', e.message);
-      return Response.json(fallback);
+        );
+        if (!r.ok) throw new Error(`turn api ${r.status}`);
+        const data = await r.json();
+        iceServers.push(...[].concat(data.iceServers));
+      } catch (e) {
+        console.error('Cloudflare TURN credential error:', e.message);
+      }
     }
+
+    return Response.json({ iceServers });
   },
 };
 
