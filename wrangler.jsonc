@@ -6,6 +6,9 @@
     "directory": "./public",
     "binding": "ASSETS"
   },
+  "routes": [
+    { "pattern": "party.juryory.com", "custom_domain": true }
+  ],
   "durable_objects": {
     "bindings": [{ "name": "ROOM", "class_name": "Room" }]
   },

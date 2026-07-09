@@ -50,8 +50,8 @@ async function join() {
       })
     ).getAudioTracks()[0];
   } catch {
-    $('joinBtn').disabled = false;
-    return showLobbyError('无法访问麦克风,请在浏览器地址栏允许麦克风权限后重试');
+    // 没有麦克风设备 / 未授权:仍可进房,只是自己不发语音(能听别人、能共享和观看画面)
+    state.micTrack = null;
   }
 
   try {
@@ -162,7 +162,8 @@ function createPeerConnection(peerId) {
 
 function setupTransceivers(pc, asOfferer) {
   if (asOfferer) {
-    const mic = pc.addTransceiver(state.micTrack, { direction: 'sendrecv' });
+    // 无麦克风时用 'audio' 占位,方向仍 sendrecv:自己不发声,但能接收对方语音
+    const mic = pc.addTransceiver(state.micTrack || 'audio', { direction: 'sendrecv' });
     const video = pc.addTransceiver('video', { direction: 'sendrecv' });
     const audio = pc.addTransceiver('audio', { direction: 'sendrecv' });
     preferH264(video);
@@ -283,6 +284,7 @@ function stopShare() {
 // ---------- 麦克风 / 离开 ----------
 
 $('micBtn').addEventListener('click', () => {
+  if (!state.micTrack) return; // 无麦克风设备,按钮已禁用
   const on = !(state.micTrack.enabled = !state.micTrack.enabled);
   $('micBtn').setAttribute('aria-pressed', String(!on));
   $('micBtn').classList.toggle('is-off', on);
@@ -309,6 +311,14 @@ function enterRoom() {
   $('room').hidden = false;
   $('roomLabel').textContent = state.room;
   history.replaceState(null, '', `/?room=${encodeURIComponent(state.room)}`);
+  if (!state.micTrack) {
+    const b = $('micBtn');
+    b.disabled = true;
+    b.classList.add('is-off');
+    b.setAttribute('aria-pressed', 'false');
+    b.title = '未检测到麦克风设备';
+    b.querySelector('span').textContent = '无麦克风';
+  }
   renderMembers();
   startStatsLoop();
 }

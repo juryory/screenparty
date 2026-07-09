@@ -264,6 +264,7 @@ button:focus-visible, input:focus-visible { outline: 2px solid var(--amber); out
 .ctl[aria-pressed="true"] { color: var(--text); }
 
 .ctl.is-off { color: var(--tally); }
+.ctl:disabled { opacity: 0.45; cursor: default; }
 
 .ctl-share[aria-pressed="true"] {
   background: var(--tally);
