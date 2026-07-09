@@ -49,10 +49,61 @@ git push -u origin main
    ```
 3. 重新部署。前端会自动从 `/api/turn` 拿到临时凭证,无需改代码。
 
-**方案 B:国内 VPS 自建 coturn(约 ¥30/月,画质更好)**
+**方案 B:国内 VPS 自建 coturn(推荐,国内节点延迟低、画质好)**
 
-在腾讯云/阿里云轻量服务器装 coturn 后,把中继地址加进 `src/index.js` 里
-`turnCredentials` 返回的 `iceServers` 数组即可。
+在腾讯云/阿里云轻量服务器上装 coturn,前端会自动从 `/api/turn` 拿到**临时凭证**
+(基于 `use-auth-secret` 的 HMAC 签名,会过期,抓包也无法长期盗用你的中继带宽)。
+
+1. **放行端口**(安全组 + 系统防火墙):
+   - `3478` TCP/UDP —— STUN/TURN
+   - `5349` TCP/UDP —— TURN over TLS(可选)
+   - `49160-49200` UDP —— 中继端口段(与下方 `min-port/max-port` 一致)
+
+2. **安装并配置 coturn**(Ubuntu/Debian):
+   ```bash
+   sudo apt update && sudo apt install -y coturn
+   sudo sed -i 's/#TURNSERVER_ENABLED/TURNSERVER_ENABLED/' /etc/default/coturn
+
+   SECRET=$(openssl rand -hex 32)   # 记下来,稍后要填到 Worker
+   sudo tee /etc/turnserver.conf >/dev/null <<EOF
+   listening-port=3478
+   # 腾讯云网卡是内网 IP、公网走 NAT,必须做 公网/内网 映射:
+   external-ip=<公网IP>/<内网IP>
+   min-port=49160
+   max-port=49200
+   use-auth-secret
+   static-auth-secret=$SECRET
+   realm=turn.你的域名
+   no-cli
+   no-tcp-relay
+   # 防止被人拿去中继内网/云元数据,收敛滥用面:
+   no-multicast-peers
+   denied-peer-ip=10.0.0.0-10.255.255.255
+   denied-peer-ip=192.168.0.0-192.168.255.255
+   denied-peer-ip=169.254.0.0-169.254.255.255
+   EOF
+   sudo systemctl enable --now coturn
+   echo "静态密钥(填到 Worker 的 COTURN_SECRET):$SECRET"
+   ```
+
+3. **把服务器接进 Worker**(在本仓库目录执行):
+   ```bash
+   wrangler secret put COTURN_SECRET       # 粘贴上一步生成的 SECRET
+   # COTURN_HOST 用域名或公网 IP,放到 wrangler.jsonc 的 vars,或也用 secret:
+   echo 'COTURN_HOST=turn.你的域名' # 见下方 wrangler.jsonc 的 vars 写法
+   wrangler deploy
+   ```
+   在 `wrangler.jsonc` 里加(不敏感,用 `vars` 即可):
+   ```jsonc
+   "vars": {
+     "COTURN_HOST": "turn.你的域名"       // 或公网 IP,不带端口
+     // 若配了 TLS 证书,再加 "COTURN_TLS_HOST": "turn.你的域名"
+   }
+   ```
+   部署后打开 `https://你的站点/api/turn`,能看到 `turn:...` 且带 `username`/`credential`,即接入成功。
+
+> **带宽**:每路屏幕 ~3.5 Mbps,一对中转连接在服务器上约占 **3.5 Mbps 入 + 3.5 Mbps 出**。
+> 200M 峰值带宽可轻松扛住十几路中转;而且 TURN 只对**少数打洞失败的成员对**生效,绝大多数人仍是 P2P 直连,不经过这台机器。
 
 ## 四、带宽要求
 
