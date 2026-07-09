@@ -43,16 +43,8 @@ async function join() {
   $('joinBtn').disabled = true;
   showLobbyError('');
 
-  try {
-    state.micTrack = (
-      await navigator.mediaDevices.getUserMedia({
-        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
-      })
-    ).getAudioTracks()[0];
-  } catch {
-    // 没有麦克风设备 / 未授权:仍可进房,只是自己不发语音(能听别人、能共享和观看画面)
-    state.micTrack = null;
-  }
+  // 没有麦克风时不阻塞进房:只共享/观看画面、收听别人语音
+  state.micTrack = await acquireMic();
 
   try {
     const r = await fetch('/api/turn');
@@ -66,6 +58,26 @@ async function join() {
   state.room = room;
   localStorage.setItem('sp-name', name);
   connectSignaling();
+}
+
+// 尝试获取麦克风;拿不到就返回 null(不阻塞进房)。
+// 关键:无麦克风的机器上 getUserMedia 可能长时间挂起而不报错,所以先探测设备并加超时兜底。
+async function acquireMic() {
+  try {
+    const devices = await navigator.mediaDevices.enumerateDevices();
+    if (!devices.some((d) => d.kind === 'audioinput')) return null; // 没有麦克风设备,直接跳过
+  } catch {}
+  try {
+    const stream = await Promise.race([
+      navigator.mediaDevices.getUserMedia({
+        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+      }),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('mic-timeout')), 6000)),
+    ]);
+    return stream.getAudioTracks()[0] || null;
+  } catch {
+    return null; // 拒绝授权 / 无设备 / 超时:均按无麦克风处理
+  }
 }
 
 function showLobbyError(text) {
