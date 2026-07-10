@@ -198,11 +198,53 @@ function createPeerConnection(peerId) {
     }
   };
 
-  pc.onconnectionstatechange = () => {
-    if (pc.connectionState === 'failed') pc.restartIce();
+  // 断连自愈:disconnected/failed 时重新协商、重新收集候选(可切到 TURN 中继)。
+  // 关键——单纯 restartIce() 不会自动重发 offer,必须由发起方主动重连。
+  const onStateChange = () => {
+    const st = pc.connectionState;
+    const ist = pc.iceConnectionState;
+    if (st === 'failed' || ist === 'failed') recoverPeer(peerId, 0);
+    else if (st === 'disconnected' || ist === 'disconnected') recoverPeer(peerId, 4000);
   };
+  pc.onconnectionstatechange = onStateChange;
+  pc.oniceconnectionstatechange = onStateChange;
 
   return pc;
+}
+
+// 触发重连:发起方直接重启 ICE;应答方发信令请发起方重启(避免双方同时发 offer 撞车)
+function triggerRestart(peerId) {
+  const peer = state.peers.get(peerId);
+  if (!peer?.pc) return;
+  const now = Date.now();
+  if (peer.restartCooldownUntil && now < peer.restartCooldownUntil) return; // 防重连风暴
+  peer.restartCooldownUntil = now + 6000;
+  if (peer.isOfferer) doIceRestart(peerId);
+  else sendSignal(peerId, { restart: true });
+}
+
+// 等 delay 毫秒后若仍未恢复,才真正重连(disconnected 常能自愈,先给它机会)
+function recoverPeer(peerId, delay) {
+  const peer = state.peers.get(peerId);
+  if (!peer?.pc) return;
+  clearTimeout(peer.recoverTimer);
+  peer.recoverTimer = setTimeout(() => {
+    const pc = peer.pc;
+    if (!pc) return;
+    const good = pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed';
+    if (!good) triggerRestart(peerId);
+  }, delay);
+}
+
+// 发起方重新协商 + 重新收集候选(iceRestart:true 会生成新 ICE 凭证,重跑连通性检查)
+async function doIceRestart(peerId) {
+  const peer = state.peers.get(peerId);
+  if (!peer?.pc) return;
+  try {
+    const offer = await peer.pc.createOffer({ iceRestart: true });
+    await peer.pc.setLocalDescription(offer);
+    sendSignal(peerId, { sdp: peer.pc.localDescription });
+  } catch {}
 }
 
 function setupTransceivers(pc, asOfferer) {
@@ -237,6 +279,7 @@ function preferH264(transceiver) {
 
 async function makeOffer(peerId) {
   const peer = state.peers.get(peerId);
+  peer.isOfferer = true; // 我发起,断连时由我负责重启 ICE
   const pc = createPeerConnection(peerId);
   peer.senders = setupTransceivers(pc, true);
   await attachScreenTo(peer); // 若自己已在共享,直接带上
@@ -256,12 +299,23 @@ async function handleSignal(from, data) {
     return;
   }
 
+  // 应答方检测到断连,请我(发起方)重启 ICE
+  if (data.restart) {
+    if (peer.isOfferer) triggerRestart(from);
+    return;
+  }
+
   if (data.sdp) {
     if (data.sdp.type === 'offer') {
+      const isNew = !peer.pc;
       const pc = peer.pc || createPeerConnection(from);
+      if (isNew) peer.isOfferer = false; // 我应答,断连时请对方重启
       await pc.setRemoteDescription(data.sdp);
-      peer.senders = setupTransceivers(pc, false);
-      await attachScreenTo(peer);
+      if (isNew) {
+        // 仅首次建连时建立 transceiver / 附加屏幕;ICE 重启的 offer 只需重新应答
+        peer.senders = setupTransceivers(pc, false);
+        await attachScreenTo(peer);
+      }
       const answer = await pc.createAnswer();
       await pc.setLocalDescription(answer);
       sendSignal(from, { sdp: pc.localDescription });
@@ -534,18 +588,30 @@ function makePlaceholder(name, key) {
 function startStatsLoop() {
   const last = new Map(); // pc -> bytes
   setInterval(async () => {
-    for (const p of state.peers.values()) {
+    for (const [id, p] of state.peers) {
       if (!p.pc || !p.tile) continue;
       try {
         const stats = await p.pc.getStats();
         stats.forEach((s) => {
           if (s.type === 'inbound-rtp' && s.kind === 'video') {
             const prev = last.get(p.pc) || 0;
-            const kbps = Math.round(((s.bytesReceived - prev) * 8) / 2000);
+            const delta = s.bytesReceived - prev;
+            const kbps = Math.round((delta * 8) / 2000);
             last.set(p.pc, s.bytesReceived);
-            p.tile.querySelector('.tile-stats').textContent =
-              `${s.frameWidth || '?'}×${s.frameHeight || '?'} ` +
-              `${s.framesPerSecond || 0}fps ${kbps}kbps`;
+            const statsEl = p.tile.querySelector('.tile-stats');
+            if (statsEl)
+              statsEl.textContent =
+                `${s.frameWidth || '?'}×${s.frameHeight || '?'} ` +
+                `${s.framesPerSecond || 0}fps ${kbps}kbps`;
+            // 卡死自愈兜底:对方在共享却连续多轮零字节(ICE 仍显示 connected 的僵死),强制重连
+            if (p.sharing) {
+              if (delta <= 0) {
+                p.stallTicks = (p.stallTicks || 0) + 1;
+                if (p.stallTicks >= 8) { p.stallTicks = 0; triggerRestart(id); } // ~16s 无数据
+              } else {
+                p.stallTicks = 0;
+              }
+            }
           }
         });
       } catch {}
