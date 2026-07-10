@@ -74,10 +74,13 @@ sudo apt update && sudo apt install -y coturn
 sudo sed -i 's/#TURNSERVER_ENABLED/TURNSERVER_ENABLED/' /etc/default/coturn
 ```
 
-**第 2 步 · 生成配置**(自动填好公网/内网 IP 与随机密钥,整段直接粘贴)
+**第 2 步 · 生成配置**(先把公网 IP 填进第一行,再整段粘贴)
 ```bash
-PUBLIC_IP=$(curl -fsS https://api.ipify.org); PRIVATE_IP=$(hostname -I | awk '{print $1}')
+PUBLIC_IP=1.2.3.4                 # ← 改成你的公网 IP(腾讯云控制台可见;国内机器别用 ipify 等境外服务自动探测,常取不到)
+PRIVATE_IP=$(ip route get 1.1.1.1 | grep -oP 'src \K\S+')   # 主内网 IP(走默认路由那块网卡,自动避开 VPN 等副网卡)
 SECRET=$(openssl rand -hex 32)
+[ -n "$PUBLIC_IP" ] && [ -n "$PRIVATE_IP" ] || { echo "公网/内网 IP 没填好,先确认再来"; }
+echo "external-ip 将写成:$PUBLIC_IP/$PRIVATE_IP"   # 务必确认斜杠两边都不为空!
 sudo tee /etc/turnserver.conf >/dev/null <<EOF
 listening-port=3478
 # 腾讯云网卡只有内网 IP、公网走 NAT,必须做 公网/内网 映射:
