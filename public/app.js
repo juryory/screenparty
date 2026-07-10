@@ -94,15 +94,18 @@ async function acquireMic() {
     const devices = await navigator.mediaDevices.enumerateDevices();
     if (!devices.some((d) => d.kind === 'audioinput')) return null; // 没有麦克风设备,直接跳过
   } catch {}
+  const micPromise = navigator.mediaDevices.getUserMedia({
+    audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+  });
   try {
     const stream = await Promise.race([
-      navigator.mediaDevices.getUserMedia({
-        audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
-      }),
+      micPromise,
       new Promise((_, reject) => setTimeout(() => reject(new Error('mic-timeout')), 6000)),
     ]);
     return stream.getAudioTracks()[0] || null;
   } catch {
+    // 超时后 getUserMedia 若迟到 resolve,顺手停掉,避免麦克风一直被占用(地址栏图标常亮)
+    micPromise.then((s) => s.getTracks().forEach((t) => t.stop())).catch(() => {});
     return null; // 拒绝授权 / 无设备 / 超时:均按无麦克风处理
   }
 }

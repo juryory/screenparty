@@ -120,6 +120,26 @@ git push -u origin main
 > **带宽**:每路屏幕 ~3.5 Mbps,一对中转连接在服务器上约占 **3.5 Mbps 入 + 3.5 Mbps 出**。
 > 200M 峰值带宽可轻松扛住十几路中转;而且 TURN 只对**少数打洞失败的成员对**生效,绝大多数人仍是 P2P 直连,不经过这台机器。
 
+### 怎么判断某人是不是走了 relay(以及值不值得自建 coturn)
+
+先用免费的 Cloudflare TURN(方案 A)顶上,别急着为兜底单开机器。是否需要自建,用**数据**决定,别靠猜:
+
+**看单次连接走没走中继** —— 画面卡的那个人,浏览器地址栏输入 `chrome://webrtc-internals`(共享/观看期间打开),找到对应的 `RTCPeerConnection` → 展开 `candidate-pair (… , succeeded)`(nominated=true 那条)→ 看两端 candidate 的 `candidateType`:
+
+| 本地/远端候选类型 | 含义 | 是否吃 TURN 带宽 |
+|------------------|------|-----------------|
+| `host` / `srflx`(server-reflexive) | **P2P 直连打洞成功** | 否,不经过服务器 |
+| 任意一端是 `relay` | **走 TURN 中继**了 | 是 |
+
+也可以看画面统计:直连的 `currentRoundTripTime` 通常是本地网络的几~几十 ms;走境外 Cloudflare relay 会明显偏高(往返绕境外)。
+
+**判断值不值得自建的标准**(满足才考虑上方案 B 自建 coturn):
+
+- 是**固定某几个人**每次都命中 `relay`(而非偶发),说明他们之间 P2P 长期打不通;**并且**
+- 这些人反映境外 relay 的延迟/卡顿实际影响了开黑体验。
+
+只有上面两条同时成立,自建国内 coturn 才划算——把那几对人的中继路径从境外拉回国内。否则维持 Cloudflare 免费兜底即可,零运维。
+
 ## 五、带宽要求
 
 每路屏幕限制在 3.5 Mbps。N 人房间中,**正在共享的人**上行 ≈ 3.5 × (N−1) Mbps:
