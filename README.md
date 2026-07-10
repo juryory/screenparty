@@ -64,58 +64,99 @@ git push -u origin main
    ```
 3. 重新部署。前端会自动从 `/api/turn` 拿到临时凭证,无需改代码。
 
-**方案 B:国内 VPS 自建 coturn(推荐,国内节点延迟低、画质好)**
+**方案 B:自建 coturn(国内 VPS,推荐)—— 从零搭建教程**
 
-在腾讯云/阿里云轻量服务器上装 coturn,前端会自动从 `/api/turn` 拿到**临时凭证**
-(基于 `use-auth-secret` 的 HMAC 签名,会过期,抓包也无法长期盗用你的中继带宽)。
+> 适用:一台国内云服务器(腾讯云等),已重装为 **Ubuntu/Debian**。宝塔面板可选(用于看负载、放行端口、申请 TLS 证书,不是必需)。前端会自动从 `/api/turn` 拿到**临时凭证**(`use-auth-secret` 的 HMAC 签名,会过期,抓包也无法长期盗用你的中继带宽)。全程约 10 分钟。
 
-1. **放行端口**(安全组 + 系统防火墙):
-   - `3478` TCP/UDP —— STUN/TURN
-   - `5349` TCP/UDP —— TURN over TLS(可选)
-   - `49160-49200` UDP —— 中继端口段(与下方 `min-port/max-port` 一致)
+**第 1 步 · 安装 coturn**
+```bash
+sudo apt update && sudo apt install -y coturn
+sudo sed -i 's/#TURNSERVER_ENABLED/TURNSERVER_ENABLED/' /etc/default/coturn
+```
 
-2. **安装并配置 coturn**(Ubuntu/Debian):
-   ```bash
-   sudo apt update && sudo apt install -y coturn
-   sudo sed -i 's/#TURNSERVER_ENABLED/TURNSERVER_ENABLED/' /etc/default/coturn
+**第 2 步 · 生成配置**(自动填好公网/内网 IP 与随机密钥,整段直接粘贴)
+```bash
+PUBLIC_IP=$(curl -fsS https://api.ipify.org); PRIVATE_IP=$(hostname -I | awk '{print $1}')
+SECRET=$(openssl rand -hex 32)
+sudo tee /etc/turnserver.conf >/dev/null <<EOF
+listening-port=3478
+# 腾讯云网卡只有内网 IP、公网走 NAT,必须做 公网/内网 映射:
+external-ip=$PUBLIC_IP/$PRIVATE_IP
+min-port=49160
+max-port=49200
+use-auth-secret
+static-auth-secret=$SECRET
+realm=$PUBLIC_IP
+no-cli
+no-tcp-relay
+# 收敛滥用面:禁止被拿去中继内网 / 云元数据
+no-multicast-peers
+denied-peer-ip=10.0.0.0-10.255.255.255
+denied-peer-ip=192.168.0.0-192.168.255.255
+denied-peer-ip=169.254.0.0-169.254.255.255
+EOF
+echo "==== 下面两个值第 6 步要填到 Worker,记下来 ===="
+echo "COTURN_SECRET = $SECRET"
+echo "COTURN_HOST   = $PUBLIC_IP"
+```
 
-   SECRET=$(openssl rand -hex 32)   # 记下来,稍后要填到 Worker
-   sudo tee /etc/turnserver.conf >/dev/null <<EOF
-   listening-port=3478
-   # 腾讯云网卡是内网 IP、公网走 NAT,必须做 公网/内网 映射:
-   external-ip=<公网IP>/<内网IP>
-   min-port=49160
-   max-port=49200
-   use-auth-secret
-   static-auth-secret=$SECRET
-   realm=turn.你的域名
-   no-cli
-   no-tcp-relay
-   # 防止被人拿去中继内网/云元数据,收敛滥用面:
-   no-multicast-peers
-   denied-peer-ip=10.0.0.0-10.255.255.255
-   denied-peer-ip=192.168.0.0-192.168.255.255
-   denied-peer-ip=169.254.0.0-169.254.255.255
-   EOF
-   sudo systemctl enable --now coturn
-   echo "静态密钥(填到 Worker 的 COTURN_SECRET):$SECRET"
+**第 3 步 · 放行端口(两层都要,少一层就连不上)**
+- **腾讯云控制台 → 安全组 → 入站规则**:
+  - `3478` TCP + UDP —— STUN/TURN
+  - `49160-49200` UDP —— 中继端口段
+  - (配 TLS 才需要)`5349` TCP + UDP
+- **宝塔面板 → 安全 → 防火墙**:放行同样端口,**务必勾选 UDP**(宝塔默认常只放 TCP,漏了 UDP 会连不上)
+
+**第 4 步 · 启动并设为开机自启**
+```bash
+sudo systemctl enable --now coturn
+```
+
+**第 5 步 · 安装 `party` 管理命令**(可选,像宝塔的 bt 一样管服务)
+```bash
+sudo curl -fsSL https://raw.githubusercontent.com/juryory/screenparty/main/scripts/party -o /usr/local/bin/party
+sudo chmod +x /usr/local/bin/party
+sudo party status     # 应显示「● coturn 运行中」、监听 3478
+```
+| 命令 | 作用 |
+|------|------|
+| `party`(或 `party status`) | 看状态:运行/停止、开机自启、监听端口、当前连接数 |
+| `party start` / `stop` / `restart` | 启动 / 关闭 / 重启(改完配置用 `restart` 生效) |
+| `party on` / `off` | 开机自启 开 / 关 |
+| `party log` | 实时日志(排查问题) |
+| `party conf` | 查看配置文件 |
+
+**第 6 步 · 接进 Worker**(在本仓库目录执行)
+```bash
+wrangler secret put COTURN_SECRET     # 粘贴第 2 步输出的 SECRET
+```
+在 `wrangler.jsonc` 里加(不敏感,用 `vars` 即可):
+```jsonc
+"vars": {
+  "COTURN_HOST": "第2步的公网IP,或你的域名"   // 不带端口
+  // 配了 TLS(下方进阶)再加:"COTURN_TLS_HOST": "turn.你的域名"
+}
+```
+```bash
+wrangler deploy
+```
+
+**第 7 步 · 验证**
+- 打开 `https://party.juryory.com/api/turn`,看到 `turn:...` 且带 `username`/`credential` → 接入成功
+- 想确认真能中继:用 [Trickle ICE 测试页](https://webrtc.github.io/samples/src/content/peerconnection/trickle-ice/) 填 `turn:你的公网IP:3478?transport=udp` + 上面的 `username`/`credential`,点 **Gather candidates**,出现 `relay` 类型候选 = 中继链路已通
+
+**(进阶 · 可选)开启 TLS —— 让 `turns://` 穿透只放行 443/加密流量的严格网络**
+
+需要一个域名(如 `turn.你的域名`)解析到这台服务器:
+
+1. 宝塔 → 网站 → 为 `turn.你的域名` 申请 Let's Encrypt 证书
+2. 在 `/etc/turnserver.conf` 末尾追加(**用 5349,别用 443**——443 被宝塔的网站占着,会冲突):
+   ```ini
+   tls-listening-port=5349
+   cert=/www/server/panel/vhost/cert/turn.你的域名/fullchain.pem
+   pkey=/www/server/panel/vhost/cert/turn.你的域名/privkey.pem
    ```
-
-3. **把服务器接进 Worker**(在本仓库目录执行):
-   ```bash
-   wrangler secret put COTURN_SECRET       # 粘贴上一步生成的 SECRET
-   # COTURN_HOST 用域名或公网 IP,放到 wrangler.jsonc 的 vars,或也用 secret:
-   echo 'COTURN_HOST=turn.你的域名' # 见下方 wrangler.jsonc 的 vars 写法
-   wrangler deploy
-   ```
-   在 `wrangler.jsonc` 里加(不敏感,用 `vars` 即可):
-   ```jsonc
-   "vars": {
-     "COTURN_HOST": "turn.你的域名"       // 或公网 IP,不带端口
-     // 若配了 TLS 证书,再加 "COTURN_TLS_HOST": "turn.你的域名"
-   }
-   ```
-   部署后打开 `https://你的站点/api/turn`,能看到 `turn:...` 且带 `username`/`credential`,即接入成功。
+3. `sudo party restart`;并在 `wrangler.jsonc` 的 `vars` 加 `"COTURN_TLS_HOST": "turn.你的域名"`,再 `wrangler deploy`
 
 > **带宽**:每路屏幕 ~3.5 Mbps,一对中转连接在服务器上约占 **3.5 Mbps 入 + 3.5 Mbps 出**。
 > 200M 峰值带宽可轻松扛住十几路中转;而且 TURN 只对**少数打洞失败的成员对**生效,绝大多数人仍是 P2P 直连,不经过这台机器。
