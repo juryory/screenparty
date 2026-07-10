@@ -117,10 +117,13 @@ sudo systemctl enable --now coturn
 
 **第 5 步 · 安装 `party` 管理命令**(可选,像宝塔的 bt 一样管服务)
 ```bash
-sudo curl -fsSL https://raw.githubusercontent.com/juryory/screenparty/main/scripts/party -o /usr/local/bin/party
+# 用 jsDelivr CDN(国内可达;raw.githubusercontent.com 在国内常连不上)
+sudo curl -fsSL "https://cdn.jsdelivr.net/gh/juryory/screenparty@main/scripts/party" -o /usr/local/bin/party
 sudo chmod +x /usr/local/bin/party
 sudo party status     # 应显示「● coturn 运行中」、监听 3478
 ```
+
+> jsDelivr 对 `@main` 有缓存(更新脚本后可能延迟几小时);想立刻拿最新版,把 `@main` 换成对应的 commit 短哈希即可。
 | 命令 | 作用 |
 |------|------|
 | `party` | **交互菜单**:输数字选操作(状态/启停/重启/日志/自启/配置),像宝塔那样 |
