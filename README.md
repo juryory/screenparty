@@ -4,7 +4,7 @@
 
 - 画面与语音在成员之间 **WebRTC P2P 直连**,不经过任何服务器,走各自家宽,同城延迟通常 5–30ms
 - Cloudflare 只承担信令(进房间时交换连接信息的几 KB 流量),全部落在免费额度内
-- 浏览器打开链接即用,无需安装、无需注册
+- 账号鉴权:仅管理员分配的账号可登录使用,**禁止匿名与自助注册**(适合固定的开黑小圈子)
 - 每路屏幕最高 1080p30,针对游戏画面优化(H.264 硬编优先、运动内容提示、保帧率降级)
 - 每个画面角落实时显示 分辨率 / 帧率 / 码率,方便排查网络问题
 
@@ -17,11 +17,26 @@ cd screenparty
 wrangler deploy
 ```
 
-部署完成后输出一个 `https://screenparty.<你的子域>.workers.dev` 地址,发给朋友即可开黑。
+部署完成后输出一个 `https://screenparty.<你的子域>.workers.dev` 地址。**首次部署后还需配置管理员账号(见第二节),否则无人能登录。**
 
 > **建议绑定自定义域名**:`*.workers.dev` 在国内偶发 DNS 污染。在 Cloudflare dashboard → Workers → screenparty → Settings → Domains & Routes 添加你自己的域名(你做投注平台用过的域名加个子域即可)。
 
-## 二、放到 GitHub(可选,推荐)
+## 二、账号鉴权(必配)
+
+系统禁止匿名使用和自助注册:必须先有账号才能进房间。管理员账号通过 Cloudflare Secret 注入,首次访问时自动创建。
+
+```bash
+wrangler secret put ADMIN_USERNAME   # 例如 admin
+wrangler secret put ADMIN_PASSWORD   # 至少 6 位,建议用强密码
+wrangler secret put ADMIN_NICKNAME   # 可选,房间里显示的名字,缺省用用户名
+wrangler deploy                       # 重新部署使其生效
+```
+
+- **本地开发**:把上面三项写进项目根目录的 `.dev.vars`(已被 `.gitignore` 忽略,不会提交),再 `npm run dev`。
+- **管理其他用户**:用管理员登录后,点击大厅的「用户管理」进入 `/admin.html`,可**新增 / 改昵称 / 重置密码 / 启用停用 / 删除**普通用户。普通用户无管理权限,进房间的昵称由管理员设定、用户不可改。
+- **安全说明**:密码仅以 PBKDF2 加盐哈希存储(不留明文),会话走 `HttpOnly; Secure` Cookie;停用或删除用户会立即使其在线会话失效。管理员账号一旦创建,改密走管理界面,再改环境变量不会覆盖已有账号。
+
+## 三、放到 GitHub(可选,推荐)
 
 ```bash
 cd screenparty
@@ -33,7 +48,7 @@ git push -u origin main
 之后可在 Cloudflare dashboard → Workers → 创建应用时选择「Connect to Git」关联该仓库,
 以后每次 push 自动部署,不再需要本地 wrangler。
 
-## 三、TURN 兜底(可选,直连失败时再配)
+## 四、TURN 兜底(可选,直连失败时再配)
 
 先直接用:朋友之间同城/同运营商时 P2P 打洞成功率很高,大概率用不到 TURN。
 
@@ -105,7 +120,7 @@ git push -u origin main
 > **带宽**:每路屏幕 ~3.5 Mbps,一对中转连接在服务器上约占 **3.5 Mbps 入 + 3.5 Mbps 出**。
 > 200M 峰值带宽可轻松扛住十几路中转;而且 TURN 只对**少数打洞失败的成员对**生效,绝大多数人仍是 P2P 直连,不经过这台机器。
 
-## 四、带宽要求
+## 五、带宽要求
 
 每路屏幕限制在 3.5 Mbps。N 人房间中,**正在共享的人**上行 ≈ 3.5 × (N−1) Mbps:
 

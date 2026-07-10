@@ -10,12 +10,23 @@
     { "pattern": "party.juryory.com", "custom_domain": true }
   ],
   "durable_objects": {
-    "bindings": [{ "name": "ROOM", "class_name": "Room" }]
+    "bindings": [
+      { "name": "ROOM", "class_name": "Room" },
+      // 单例账号/会话存储(idFromName("global")):用户表 + 会话表
+      { "name": "AUTH", "class_name": "Auth" }
+    ]
   },
   "migrations": [
     // SQLite-backed DO:Workers 免费计划即可使用
-    { "tag": "v1", "new_sqlite_classes": ["Room"] }
+    { "tag": "v1", "new_sqlite_classes": ["Room"] },
+    { "tag": "v2", "new_sqlite_classes": ["Auth"] }
   ]
+  // 鉴权:首次访问时用下列 secret 自动创建管理员账号(不进代码库)
+  //   wrangler secret put ADMIN_USERNAME
+  //   wrangler secret put ADMIN_PASSWORD
+  //   wrangler secret put ADMIN_NICKNAME   // 可选,缺省用用户名
+  // 本地开发把它们写进 .dev.vars(已被 .gitignore 忽略)
+  //
   // 可选:接入 Cloudflare Realtime TURN 作打洞失败兜底
   // 在 dashboard 创建 TURN key 后执行:
   //   wrangler secret put TURN_KEY_ID

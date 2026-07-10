@@ -8,20 +8,23 @@
 </head>
 <body>
 
-<!-- 加入界面 -->
-<section id="lobby" class="lobby">
+<!-- 加入界面(需已登录;未登录会被 app.js 跳转到 /login.html) -->
+<section id="lobby" class="lobby" hidden>
   <div class="lobby-card">
     <div class="brand">
       <span class="brand-dot" aria-hidden="true"></span>
       <h1>ScreenParty</h1>
       <p class="brand-sub">多人同屏 · 语音开黑 · P2P 直连</p>
     </div>
-    <label for="nameInput">你的昵称</label>
-    <input id="nameInput" maxlength="24" placeholder="例如:老张" autocomplete="off" />
+    <p class="lobby-greeting">你好,<strong id="lobbyNick"></strong></p>
     <label for="roomInput">房间名</label>
     <input id="roomInput" maxlength="32" placeholder="和朋友约定同一个房间名" autocomplete="off" />
     <button id="joinBtn" class="btn-primary">进入房间</button>
     <p id="lobbyError" class="lobby-error" hidden></p>
+    <div class="lobby-actions">
+      <a id="adminLink" class="btn-ghost" href="/admin.html" hidden>用户管理</a>
+      <button id="logoutBtn" class="btn-ghost">退出登录</button>
+    </div>
     <p class="lobby-hint">进入后浏览器会请求麦克风权限。画面与声音在成员之间点对点传输,不经过服务器。</p>
   </div>
 </section>

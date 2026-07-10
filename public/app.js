@@ -22,21 +22,50 @@ const state = {
 
 const SCREEN_MAX_BITRATE = 3_500_000; // ~3.5 Mbps,5 人 mesh 下每人上行约 14 Mbps
 
-// ---------- 加入流程 ----------
+// ---------- 鉴权 / 登录 ----------
 
 const params = new URLSearchParams(location.search);
 if (params.get('room')) $('roomInput').value = params.get('room');
-$('nameInput').value = localStorage.getItem('sp-name') || '';
+
+// 启动:查当前身份 —— 未登录跳转到独立的登录页,登录后才回到本页(大厅)
+bootstrapAuth();
+
+async function bootstrapAuth() {
+  let me = null;
+  try {
+    const r = await fetch('/api/me');
+    if (r.ok) me = (await r.json()).user;
+  } catch {}
+  if (me) showLobby(me);
+  else {
+    const room = params.get('room');
+    location.replace(room ? `/login.html?room=${encodeURIComponent(room)}` : '/login.html');
+  }
+}
+
+function showLobby(me) {
+  state.myName = me.nickname;
+  $('lobby').hidden = false;
+  $('lobbyNick').textContent = me.nickname;
+  $('adminLink').hidden = !me.isAdmin;
+}
+
+$('logoutBtn').addEventListener('click', async () => {
+  try {
+    await fetch('/api/logout', { method: 'POST' });
+  } catch {}
+  location.replace('/login.html');
+});
+
+// ---------- 加入流程 ----------
 
 $('joinBtn').addEventListener('click', join);
-[$('nameInput'), $('roomInput')].forEach((el) =>
-  el.addEventListener('keydown', (e) => e.key === 'Enter' && join()),
-);
+$('roomInput').addEventListener('keydown', (e) => e.key === 'Enter' && join());
 
 async function join() {
-  const name = $('nameInput').value.trim();
   const room = $('roomInput').value.trim();
-  if (!name || !room) return showLobbyError('请填写昵称和房间名');
+  if (!state.myName) return showLobbyError('登录状态已失效,请重新登录');
+  if (!room) return showLobbyError('请填写房间名');
   if (!/^[\w\u4e00-\u9fff-]{1,32}$/.test(room))
     return showLobbyError('房间名只能包含中英文、数字、下划线和连字符');
 
@@ -54,9 +83,7 @@ async function join() {
     }
   } catch {}
 
-  state.myName = name;
-  state.room = room;
-  localStorage.setItem('sp-name', name);
+  state.room = room; // state.myName 已在登录后锁定为账号昵称
   connectSignaling();
 }
 

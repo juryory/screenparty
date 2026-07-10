@@ -1,0 +1,52 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>ScreenParty · 用户管理</title>
+<link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+
+<section id="admin" class="admin" hidden>
+  <header class="admin-top">
+    <div class="brand">
+      <span class="brand-dot" aria-hidden="true"></span>
+      <h1>用户管理</h1>
+    </div>
+    <a class="btn-ghost" href="/">← 返回房间</a>
+  </header>
+
+  <div class="admin-body">
+    <!-- 新增用户 -->
+    <form id="createForm" class="admin-card admin-create">
+      <h2>新增用户</h2>
+      <div class="admin-fields">
+        <label>用户名<input id="cUser" maxlength="32" placeholder="字母/数字/下划线" autocomplete="off" required /></label>
+        <label>显示昵称<input id="cNick" maxlength="24" placeholder="房间里显示的名字" autocomplete="off" required /></label>
+        <label>初始密码<input id="cPass" type="password" maxlength="128" placeholder="至少 6 位" autocomplete="new-password" required /></label>
+        <label class="admin-check"><input id="cEnabled" type="checkbox" checked /> 启用</label>
+      </div>
+      <button class="btn-primary" type="submit">创建用户</button>
+      <p id="createMsg" class="admin-msg" hidden></p>
+    </form>
+
+    <!-- 用户列表 -->
+    <div class="admin-card">
+      <h2>用户列表</h2>
+      <div class="admin-table-wrap">
+        <table class="admin-table">
+          <thead>
+            <tr><th>用户名</th><th>昵称</th><th>角色</th><th>状态</th><th>操作</th></tr>
+          </thead>
+          <tbody id="userRows"></tbody>
+        </table>
+      </div>
+      <p id="listMsg" class="admin-msg" hidden></p>
+    </div>
+  </div>
+</section>
+
+<script src="/admin.js"></script>
+</body>
+</html>
