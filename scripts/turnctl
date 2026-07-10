@@ -1,0 +1,56 @@
+#!/usr/bin/env bash
+# turnctl —— ScreenParty 兜底服务器(coturn)便捷管理命令
+#
+# 安装(在服务器上执行一次):
+#   sudo install -m 0755 scripts/turnctl /usr/local/bin/turn
+# 之后就像宝塔的 bt 一样用:
+#   turn              # 看状态(运行中/停止、是否自启、监听端口、连接数)
+#   turn start        # 启动
+#   turn stop         # 关闭
+#   turn restart      # 重启(改完 /etc/turnserver.conf 用它生效)
+#   turn on / off     # 开机自启 开 / 关
+#   turn log          # 实时日志(排查问题)
+#   turn conf         # 查看配置文件
+#
+# 提示:连接数/监听端口需 root 才准,状态类命令建议加 sudo(如 sudo turn)。
+
+set -euo pipefail
+
+SVC=coturn
+CONF=/etc/turnserver.conf
+
+# 需要改动服务的操作:非 root 时自动用 sudo 重新执行整条命令
+as_root() { [ "$(id -u)" -eq 0 ] || exec sudo "$0" "$@"; }
+
+show_status() {
+  if systemctl is-active --quiet "$SVC"; then
+    echo "● coturn 运行中"
+  else
+    echo "○ coturn 已停止"
+  fi
+  if systemctl is-enabled --quiet "$SVC" 2>/dev/null; then
+    echo "  开机自启:是"
+  else
+    echo "  开机自启:否"
+  fi
+  local ports conns
+  ports=$(ss -tunlp 2>/dev/null | grep -i turnserver | awk '{print $5}' | sort -u | tr '\n' ' ')
+  conns=$(ss -tunap 2>/dev/null | grep -c -i turnserver || true)
+  echo "  监听:${ports:-未监听(需 sudo 才能显示)}"
+  echo "  当前连接:${conns:-0}"
+}
+
+case "${1:-status}" in
+  start)   as_root "$@"; systemctl start   "$SVC"; echo "✓ coturn 已启动" ;;
+  stop)    as_root "$@"; systemctl stop    "$SVC"; echo "✓ coturn 已停止" ;;
+  restart) as_root "$@"; systemctl restart "$SVC"; echo "✓ coturn 已重启" ;;
+  reload)  as_root "$@"; systemctl reload-or-restart "$SVC"; echo "✓ 配置已重载" ;;
+  on)      as_root "$@"; systemctl enable  "$SVC"; echo "✓ 已设为开机自启" ;;
+  off)     as_root "$@"; systemctl disable "$SVC"; echo "✓ 已取消开机自启" ;;
+  status)  show_status ;;
+  log)     journalctl -u "$SVC" -n 100 -f ;;
+  conf)    "${PAGER:-less}" "$CONF" ;;
+  *)
+    echo "用法:turn {start|stop|restart|reload|status|log|conf|on|off}"
+    exit 1 ;;
+esac
