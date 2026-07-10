@@ -17,10 +17,13 @@ const state = {
   iceServers: [{ urls: 'stun:stun.cloudflare.com:3478' }],
   micTrack: null,
   screenStream: null,
-  peers: new Map(), // id -> { name, sharing, pc, senders, tile, videoStream, audioEl, stats }
+  peers: new Map(), // id -> { name, sharing, pc, senders, tile, videoStream, audioEl, sendQuality, viewReq }
+  focusedId: null,  // 当前主舞台显示谁:peer id / 'local' / null
 };
 
-const SCREEN_MAX_BITRATE = 3_500_000; // ~3.5 Mbps,5 人 mesh 下每人上行约 14 Mbps
+const SCREEN_MAX_BITRATE = 3_500_000; // ~3.5 Mbps,主窗口(被人放大观看)的全码率
+const THUMB_MAX_BITRATE = 300_000;    // 缩略图(没在主窗口看的共享)只发 ~300kbps
+const THUMB_SCALE = 3;                // 且分辨率降到 1/3,低码率下更耐看
 
 // ---------- 鉴权 / 登录 ----------
 
@@ -246,6 +249,13 @@ async function handleSignal(from, data) {
   let peer = state.peers.get(from);
   if (!peer) return;
 
+  // 对方告诉我:把发给他的这一路调成高清(他放主窗口)还是缩略图
+  if (data.want) {
+    peer.sendQuality = data.want === 'high' ? 'high' : 'low';
+    applySendQuality(peer);
+    return;
+  }
+
   if (data.sdp) {
     if (data.sdp.type === 'offer') {
       const pc = peer.pc || createPeerConnection(from);
@@ -301,13 +311,22 @@ async function attachScreenTo(peer) {
   const at = state.screenStream.getAudioTracks()[0];
   if (vt) {
     await peer.senders.video.replaceTrack(vt);
-    const p = peer.senders.video.getParameters();
-    if (!p.encodings?.length) p.encodings = [{}];
-    p.encodings[0].maxBitrate = SCREEN_MAX_BITRATE;
-    p.degradationPreference = 'maintain-framerate'; // 带宽不足时降分辨率保帧率
-    await peer.senders.video.setParameters(p).catch(() => {});
+    applySendQuality(peer);
   }
   if (at) await peer.senders.screenAudio.replaceTrack(at);
+}
+
+// 按对方请求的清晰度设置发给他的这一路:主窗口=全码率全分辨率,缩略图=低码率+降分辨率。
+// mesh 里每对成员是独立 PeerConnection、独立编码器,所以能对不同人发不同码率。
+function applySendQuality(peer) {
+  if (!peer.senders?.video || !state.screenStream) return;
+  const high = peer.sendQuality === 'high';
+  const p = peer.senders.video.getParameters();
+  if (!p.encodings?.length) p.encodings = [{}];
+  p.encodings[0].maxBitrate = high ? SCREEN_MAX_BITRATE : THUMB_MAX_BITRATE;
+  p.encodings[0].scaleResolutionDownBy = high ? 1 : THUMB_SCALE;
+  p.degradationPreference = 'maintain-framerate'; // 带宽不足时降分辨率保帧率
+  peer.senders.video.setParameters(p).catch(() => {});
 }
 
 function stopShare() {
@@ -399,60 +418,115 @@ function renderMembers() {
 
 let localTile = null;
 
+// 演讲者视图:焦点那块进主舞台(#stage),其余(含未共享成员的占位块)进右侧胶片栏(#rail)。
 function refreshTiles() {
-  const grid = $('grid');
+  const stage = $('stage');
+  const rail = $('rail');
 
-  // 本地预览
+  // 本地共享的预览瓦片
   if (state.screenStream && !localTile) {
-    localTile = makeTile(`${state.myName}(我)`, state.screenStream, true);
-    grid.appendChild(localTile);
+    localTile = makeTile(`${state.myName}(我)`, state.screenStream, true, 'local');
   } else if (!state.screenStream && localTile) {
+    if (state.focusedId === 'local') state.focusedId = null;
     localTile.remove();
     localTile = null;
   }
 
-  // 远端画面:sharing 且已收到视频 track 才显示
+  // 每个成员一块瓦片:正在共享→视频瓦片;未共享→占位瓦片。共享状态切换时换瓦片类型。
   for (const [id, p] of state.peers) {
-    const shouldShow = p.sharing && p.videoStream?.getVideoTracks().length;
-    if (shouldShow && !p.tile) {
-      p.tile = makeTile(p.name, p.videoStream, false);
-      p.tile.dataset.peer = id;
-      grid.appendChild(p.tile);
-    } else if (!shouldShow && p.tile) {
+    const hasVideo = p.sharing && p.videoStream?.getVideoTracks().length;
+    const kind = hasVideo ? 'video' : 'placeholder';
+    if (p.tile && p.tileKind !== kind) {
       p.tile.remove();
       p.tile = null;
     }
+    if (!p.tile) {
+      p.tile = hasVideo
+        ? makeTile(p.name, p.videoStream, false, id)
+        : makePlaceholder(p.name, id);
+      p.tileKind = kind;
+    }
   }
 
-  const count = grid.querySelectorAll('.tile').length;
-  grid.dataset.count = String(Math.min(count, 6));
-  if (count < 2) exitFocus();
+  // 焦点失效(那块没了)则自动挑一个:优先别人的共享,其次自己的共享,再没有就留空
+  const tiles = collectTiles();
+  if (!state.focusedId || !tiles.has(state.focusedId)) {
+    state.focusedId = pickDefaultFocus();
+  }
+
+  // 放置:焦点进主舞台,其余进胶片栏(仅在父节点变化时移动,减少 video 重排)
+  for (const [key, tile] of tiles) {
+    const inStage = key === state.focusedId;
+    tile.classList.toggle('is-main', inStage);
+    const parent = inStage ? stage : rail;
+    if (tile.parentElement !== parent) parent.appendChild(tile);
+  }
+
+  $('emptyState').hidden = !!state.focusedId;
+  updateViewQuality();
   renderMembers();
 }
 
-function makeTile(name, stream, muted) {
+function collectTiles() {
+  const m = new Map();
+  if (localTile) m.set('local', localTile);
+  for (const [id, p] of state.peers) if (p.tile) m.set(id, p.tile);
+  return m;
+}
+
+function pickDefaultFocus() {
+  for (const [id, p] of state.peers)
+    if (p.sharing && p.videoStream?.getVideoTracks().length) return id;
+  if (state.screenStream) return 'local';
+  return null;
+}
+
+function setFocus(key) {
+  state.focusedId = key;
+  refreshTiles();
+}
+
+// 我在看谁 → 告诉每个正在共享的人:把我当主窗口的发高清,其余发缩略图(省上行/下行带宽)
+function updateViewQuality() {
+  for (const [id, p] of state.peers) {
+    if (!p.sharing) {
+      p.viewReq = null;
+      continue;
+    }
+    const want = state.focusedId === id ? 'high' : 'low';
+    if (p.viewReq !== want) {
+      p.viewReq = want;
+      sendSignal(id, { want });
+    }
+  }
+}
+
+function makeTile(name, stream, muted, key) {
   const tile = $('tileTemplate').content.firstElementChild.cloneNode(true);
   const video = tile.querySelector('video');
   video.srcObject = stream;
   video.muted = muted; // 本地预览静音,防回声
   tile.querySelector('.umd-name').textContent = name;
   tile.classList.add('on-air');
-  tile.addEventListener('click', () => toggleFocus(tile));
+  tile.dataset.key = key;
+  tile.addEventListener('click', () => setFocus(key));
   tile.addEventListener('dblclick', () => video.requestFullscreen?.());
   return tile;
 }
 
-function toggleFocus(tile) {
-  const grid = $('grid');
-  if (tile.classList.contains('is-focus')) return exitFocus();
-  grid.querySelectorAll('.tile').forEach((t) => t.classList.remove('is-focus'));
-  tile.classList.add('is-focus');
-  grid.classList.add('focused');
-}
-
-function exitFocus() {
-  $('grid').classList.remove('focused');
-  $('grid').querySelectorAll('.tile').forEach((t) => t.classList.remove('is-focus'));
+function makePlaceholder(name, key) {
+  const tile = $('tileTemplate').content.firstElementChild.cloneNode(true);
+  tile.classList.add('is-placeholder');
+  tile.dataset.key = key;
+  tile.querySelector('video').remove();
+  const ph = document.createElement('div');
+  ph.className = 'ph-body';
+  ph.textContent = name.slice(0, 2);
+  tile.insertBefore(ph, tile.firstChild);
+  tile.querySelector('.umd-name').textContent = name;
+  tile.querySelector('.umd-tally').textContent = '未共享';
+  tile.addEventListener('click', () => setFocus(key));
+  return tile;
 }
 
 // ---------- 实时统计(分辨率 / fps / 码率) ----------

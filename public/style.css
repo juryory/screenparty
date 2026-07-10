@@ -228,27 +228,37 @@ button:focus-visible, input:focus-visible { outline: 2px solid var(--amber); out
   box-shadow: 0 0 6px var(--tally);
 }
 
-/* ---------- Multiview 网格 ---------- */
+/* ---------- 主舞台 + 胶片栏(演讲者视图) ---------- */
 
-.grid {
+.stage-wrap {
   flex: 1;
   min-height: 0;
-  display: grid;
+  display: flex;
   gap: 8px;
   padding: 8px;
-  grid-template-columns: repeat(var(--cols, 1), 1fr);
-  align-content: center;
 }
 
-.grid[data-count="0"] { place-items: center; }
-.grid[data-count="1"] { --cols: 1; }
-.grid[data-count="2"] { --cols: 2; }
-.grid[data-count="3"], .grid[data-count="4"] { --cols: 2; }
-.grid[data-count="5"], .grid[data-count="6"] { --cols: 3; }
+.stage {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  position: relative;
+}
+
+.rail {
+  flex: 0 0 208px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding-right: 2px;
+}
+.rail:empty { display: none; }
 
 .empty { text-align: center; color: var(--text-dim); }
 .empty-sub { font-size: 13px; margin-top: 6px; }
-.grid:not([data-count="0"]) .empty { display: none; }
 
 .tile {
   position: relative;
@@ -257,8 +267,6 @@ button:focus-visible, input:focus-visible { outline: 2px solid var(--amber); out
   border-radius: 6px;
   overflow: hidden;
   min-height: 0;
-  aspect-ratio: 16 / 9;
-  align-self: center;
   cursor: pointer;
 }
 
@@ -272,11 +280,28 @@ button:focus-visible, input:focus-visible { outline: 2px solid var(--amber); out
   background: #000;
 }
 
-/* 聚焦模式:点击某路放大,其余缩为侧栏 */
-.grid.focused { --cols: 1; grid-template-columns: 1fr 180px; grid-auto-rows: min-content; }
-.grid.focused .tile { aspect-ratio: auto; }
-.grid.focused .tile.is-focus { grid-column: 1; grid-row: 1 / span 99; height: 100%; }
-.grid.focused .tile:not(.is-focus) { grid-column: 2; aspect-ratio: 16/9; }
+/* 主舞台里的那块:铺满、当前焦点不再是手型 */
+.stage .tile { width: 100%; height: 100%; }
+.stage .tile.is-main { cursor: default; }
+
+/* 胶片栏里的每块:16:9 缩略图,悬停高亮 */
+.rail .tile { width: 100%; aspect-ratio: 16 / 9; flex: 0 0 auto; transition: border-color 0.15s; }
+.rail .tile:hover { border-color: var(--text-dim); }
+.rail .tile-stats { display: none; }  /* 缩略图不显示码率角标,避免杂乱 */
+
+/* 未共享成员的占位块 */
+.tile.is-placeholder { background: var(--panel-2); display: flex; align-items: center; justify-content: center; }
+.tile.is-placeholder.on-air { border-color: var(--line); }
+.tile.is-placeholder .umd-tally { background: var(--line); color: var(--text-dim); }
+.ph-body {
+  width: 46px; height: 46px;
+  border-radius: 50%;
+  background: var(--panel);
+  color: var(--text-dim);
+  display: flex; align-items: center; justify-content: center;
+  font-weight: 600; letter-spacing: 0.5px;
+}
+.stage .tile.is-placeholder .ph-body { width: 76px; height: 76px; font-size: 22px; }
 
 .umd {
   position: absolute;
@@ -355,11 +380,16 @@ button:focus-visible, input:focus-visible { outline: 2px solid var(--amber); out
 .ctl-leave:hover { color: var(--tally); border-color: var(--tally); }
 
 @media (max-width: 640px) {
-  .grid[data-count="2"] { --cols: 1; }
-  .grid[data-count="3"], .grid[data-count="4"] { --cols: 1; }
-  .grid[data-count="5"], .grid[data-count="6"] { --cols: 2; }
-  .grid.focused { grid-template-columns: 1fr; }
-  .grid.focused .tile:not(.is-focus) { display: none; }
+  /* 窄屏:胶片栏移到主画面下方,横向滚动 */
+  .stage-wrap { flex-direction: column; }
+  .rail {
+    flex: 0 0 auto;
+    flex-direction: row;
+    width: 100%;
+    overflow-x: auto;
+    overflow-y: hidden;
+  }
+  .rail .tile { width: 140px; flex: 0 0 140px; }
 }
 
 @media (prefers-reduced-motion: reduce) {

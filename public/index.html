@@ -40,11 +40,14 @@
     <ul id="memberList" class="members" aria-label="房间成员"></ul>
   </header>
 
-  <main id="grid" class="grid" data-count="0">
-    <div id="emptyState" class="empty">
-      <p>还没有人在共享画面</p>
-      <p class="empty-sub">点击下方「共享屏幕」,把你的游戏画面播给大家</p>
+  <main class="stage-wrap">
+    <div id="stage" class="stage">
+      <div id="emptyState" class="empty">
+        <p>还没有人在共享画面</p>
+        <p class="empty-sub">点击下方「共享屏幕」把画面播给大家;右侧点头像/缩略图可切换主画面</p>
+      </div>
     </div>
+    <aside id="rail" class="rail" aria-label="其他画面与成员"></aside>
   </main>
 
   <footer class="console">
