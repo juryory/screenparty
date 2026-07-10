@@ -123,7 +123,8 @@ sudo party status     # 应显示「● coturn 运行中」、监听 3478
 ```
 | 命令 | 作用 |
 |------|------|
-| `party`(或 `party status`) | 看状态:运行/停止、开机自启、监听端口、当前连接数 |
+| `party` | **交互菜单**:输数字选操作(状态/启停/重启/日志/自启/配置),像宝塔那样 |
+| `party status` | 看状态:运行/停止、external-ip、监听端口、活跃连接数 |
 | `party start` / `stop` / `restart` | 启动 / 关闭 / 重启(改完配置用 `restart` 生效) |
 | `party on` / `off` | 开机自启 开 / 关 |
 | `party log` | 实时日志(排查问题) |

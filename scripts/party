@@ -3,57 +3,122 @@
 #
 # 安装(在服务器上执行一次):
 #   sudo install -m 0755 scripts/party /usr/local/bin/party
-# 之后就像宝塔的 bt 一样用:
-#   party              # 看状态(运行中/停止、是否自启、监听端口、连接数)
-#   party start        # 启动
-#   party stop         # 关闭
-#   party restart      # 重启(改完 /etc/turnserver.conf 用它生效)
-#   party on / off     # 开机自启 开 / 关
-#   party log          # 实时日志(排查问题)
-#   party conf         # 查看配置文件
 #
-# 提示:连接数/监听端口需 root 才准,状态类命令建议加 sudo(如 sudo party)。
+# 两种用法:
+#   party              # 直接进入交互菜单(输数字选操作,像宝塔那样)
+#   party <子命令>     # 一条命令直达,便于脚本:
+#       status  start  stop  restart  reload  on  off  log  conf
+#
+# 提示:操作服务需 root;非 root 时会自动用 sudo。
 
-set -euo pipefail
+set -uo pipefail
 
 SVC=coturn
 CONF=/etc/turnserver.conf
 
-# 需要改动服务的操作:非 root 时自动用 sudo 重新执行整条命令
-as_root() { [ "$(id -u)" -eq 0 ] || exec sudo "$0" "$@"; }
-
-show_status() {
-  if systemctl is-active --quiet "$SVC"; then
-    echo "● coturn 运行中"
-  else
-    echo "○ coturn 已停止"
-  fi
-  if systemctl is-enabled --quiet "$SVC" 2>/dev/null; then
-    echo "  开机自启:是"
-  else
-    echo "  开机自启:否"
-  fi
-  local ext ports conns
-  ext=$(grep -E '^external-ip=' "$CONF" 2>/dev/null | head -1 | cut -d= -f2)
-  ports=$(ss -tunlp 2>/dev/null | grep -i turnserver | awk '{print $5}' | sort -u | tr '\n' ' ')
-  # 只数真实活跃连接(ESTAB),排除监听 socket
-  conns=$(ss -Htunap 2>/dev/null | awk '/turnserver/ && $2 ~ /ESTAB/ {n++} END {print n + 0}')
-  [ -n "$ext" ] && echo "  external-ip:$ext"
-  echo "  监听:${ports:-未监听(需 sudo 才能显示)}"
-  echo "  活跃连接:${conns:-0}(需 sudo 才准)"
+# 用 root 权限跑 systemctl(已是 root 直接跑,否则套 sudo)
+sysctl_do() {
+  if [ "$(id -u)" -eq 0 ]; then systemctl "$@"; else sudo systemctl "$@"; fi
 }
 
-case "${1:-status}" in
-  start)   as_root "$@"; systemctl start   "$SVC"; echo "✓ coturn 已启动" ;;
-  stop)    as_root "$@"; systemctl stop    "$SVC"; echo "✓ coturn 已停止" ;;
-  restart) as_root "$@"; systemctl restart "$SVC"; echo "✓ coturn 已重启" ;;
-  reload)  as_root "$@"; systemctl reload-or-restart "$SVC"; echo "✓ 配置已重载" ;;
-  on)      as_root "$@"; systemctl enable  "$SVC"; echo "✓ 已设为开机自启" ;;
-  off)     as_root "$@"; systemctl disable "$SVC"; echo "✓ 已取消开机自启" ;;
+svc() {
+  case "$1" in
+    start)   sysctl_do start   "$SVC" && echo "✓ coturn 已启动" ;;
+    stop)    sysctl_do stop    "$SVC" && echo "✓ coturn 已停止" ;;
+    restart) sysctl_do restart "$SVC" && echo "✓ coturn 已重启" ;;
+    reload)  sysctl_do reload-or-restart "$SVC" && echo "✓ 配置已重载" ;;
+    on)      sysctl_do enable  "$SVC" && echo "✓ 已设为开机自启" ;;
+    off)     sysctl_do disable "$SVC" && echo "✓ 已取消开机自启" ;;
+  esac
+}
+
+conns_now() {
+  ss -Htunap 2>/dev/null | awk '/turnserver/ && $2 ~ /ESTAB/ {n++} END {print n + 0}'
+}
+
+show_status() {
+  if systemctl is-active --quiet "$SVC"; then echo "● coturn 运行中"; else echo "○ coturn 已停止"; fi
+  if systemctl is-enabled --quiet "$SVC" 2>/dev/null; then echo "  开机自启:是"; else echo "  开机自启:否"; fi
+  local ext ports
+  ext=$(grep -E '^external-ip=' "$CONF" 2>/dev/null | head -1 | cut -d= -f2)
+  ports=$(ss -tunlp 2>/dev/null | grep -i turnserver | awk '{print $5}' | sort -u | tr '\n' ' ')
+  [ -n "$ext" ] && echo "  external-ip:$ext"
+  echo "  监听:${ports:-未监听(需 sudo 才能显示)}"
+  echo "  活跃连接:$(conns_now)(需 sudo 才准)"
+}
+
+# ---------- 交互菜单 ----------
+
+pause() { read -rp $'\n按回车返回菜单… ' _ || true; }
+
+header() {
+  local st
+  if systemctl is-active --quiet "$SVC"; then st="● 运行中"; else st="○ 已停止"; fi
+  clear 2>/dev/null || true
+  echo "════════════════════════════════════════"
+  echo "   ScreenParty TURN 管理    coturn:$st"
+  echo "════════════════════════════════════════"
+}
+
+menu_autostart() {
+  while true; do
+    header
+    local cur
+    cur=$(systemctl is-enabled "$SVC" 2>/dev/null || echo 未知)
+    echo "  开机自启(当前:$cur)"
+    echo
+    echo "   1) 开启开机自启"
+    echo "   2) 关闭开机自启"
+    echo "   0) 返回上级"
+    read -rp $'\n请选择编号: ' c || return
+    case "$c" in
+      1) svc on;  pause ;;
+      2) svc off; pause ;;
+      0) return ;;
+      *) echo "无效选择"; sleep 1 ;;
+    esac
+  done
+}
+
+run_menu() {
+  while true; do
+    header
+    echo "   1) 查看状态"
+    echo "   2) 启动 coturn"
+    echo "   3) 停止 coturn"
+    echo "   4) 重启 coturn(改完配置用它生效)"
+    echo "   5) 实时日志(Ctrl-C 返回)"
+    echo "   6) 开机自启设置 ▶"
+    echo "   7) 查看配置文件"
+    echo "   8) 当前活跃连接数"
+    echo "   0) 退出"
+    read -rp $'\n请选择编号: ' choice || { echo; exit 0; }
+    case "$choice" in
+      1) echo; show_status; pause ;;
+      2) echo; svc start;   pause ;;
+      3) echo; svc stop;    pause ;;
+      4) echo; svc restart; pause ;;
+      5) journalctl -u "$SVC" -n 50 -f || true ;;
+      6) menu_autostart ;;
+      7) "${PAGER:-less}" "$CONF" ;;
+      8) echo; echo "当前活跃连接:$(conns_now)(需 sudo 才准)"; pause ;;
+      0|q|Q) echo "再见 👋"; exit 0 ;;
+      *) echo "无效选择"; sleep 1 ;;
+    esac
+  done
+}
+
+# ---------- 入口 ----------
+
+case "${1:-menu}" in
+  menu)    run_menu ;;
   status)  show_status ;;
+  start|stop|restart|reload) svc "$1" ;;
+  on|off)  svc "$1" ;;
   log)     journalctl -u "$SVC" -n 100 -f ;;
   conf)    "${PAGER:-less}" "$CONF" ;;
   *)
-    echo "用法:party {start|stop|restart|reload|status|log|conf|on|off}"
+    echo "用法:party            # 交互菜单"
+    echo "      party <status|start|stop|restart|reload|on|off|log|conf>"
     exit 1 ;;
 esac
