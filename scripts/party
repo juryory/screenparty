@@ -33,11 +33,14 @@ show_status() {
   else
     echo "  开机自启:否"
   fi
-  local ports conns
+  local ext ports conns
+  ext=$(grep -E '^external-ip=' "$CONF" 2>/dev/null | head -1 | cut -d= -f2)
   ports=$(ss -tunlp 2>/dev/null | grep -i turnserver | awk '{print $5}' | sort -u | tr '\n' ' ')
-  conns=$(ss -tunap 2>/dev/null | grep -c -i turnserver || true)
+  # 只数真实活跃连接(ESTAB),排除监听 socket
+  conns=$(ss -Htunap 2>/dev/null | awk '/turnserver/ && $2 ~ /ESTAB/ {n++} END {print n + 0}')
+  [ -n "$ext" ] && echo "  external-ip:$ext"
   echo "  监听:${ports:-未监听(需 sudo 才能显示)}"
-  echo "  当前连接:${conns:-0}"
+  echo "  活跃连接:${conns:-0}(需 sudo 才准)"
 }
 
 case "${1:-status}" in
