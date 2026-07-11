@@ -37,9 +37,14 @@
           </button>
         </div>
         <div id="userMenu" class="user-menu" hidden>
+          <button id="deviceBtn" class="menu-item">音频视频设备</button>
           <a id="adminLink" class="menu-item" href="/admin.html" hidden>用户管理</a>
           <button id="logoutBtn" class="menu-item">退出登录</button>
         </div>
+      </div>
+      <div id="micMeter" class="mic-meter" hidden title="麦克风电平(-24 ~ 0 dB)">
+        <div class="meter-track"><div id="meterCover" class="meter-cover"></div></div>
+        <div class="meter-scale"><span>-24</span><span>-12</span><span>0 dB</span></div>
       </div>
     </footer>
   </section>
@@ -51,6 +56,10 @@
       <span class="ch-name" id="curChannel"></span>
       <span class="ch-topic" id="curTopic"></span>
       <div class="bar-fill"></div>
+      <button id="camBtn" class="ctl ctl-cam" aria-pressed="false">
+        <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><path fill="currentColor" d="M4 6h11a1 1 0 0 1 1 1v2.5l4-3v11l-4-3V17a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1Z"/></svg>
+        <span>摄像头</span>
+      </button>
       <button id="shareBtn" class="ctl ctl-share" aria-pressed="false">
         <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><path fill="currentColor" d="M4 5h16a1 1 0 0 1 1 1v10a1 1 0 0 1-1 1h-6v2h3v2H7v-2h3v-2H4a1 1 0 0 1-1-1V6a1 1 0 0 1 1-1Zm1 2v8h14V7H5Z"/></svg>
         <span>共享屏幕</span>

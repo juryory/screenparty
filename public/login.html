@@ -8,21 +8,24 @@
 </head>
 <body>
 
-<!-- 登录界面(独立页面;无自助注册入口) -->
+<!-- 登录 / 注册(同一张卡片切换) -->
 <section id="login" class="lobby" hidden>
   <div class="lobby-card">
     <div class="brand">
       <span class="brand-dot" aria-hidden="true"></span>
       <h1>ScreenParty</h1>
-      <p class="brand-sub">请使用账号登录</p>
+      <p class="brand-sub" id="brandSub">请使用账号登录</p>
     </div>
     <label for="loginUser">用户名</label>
     <input id="loginUser" maxlength="32" placeholder="账号" autocomplete="username" />
+    <label for="loginNick" id="nickLabel" hidden>显示昵称</label>
+    <input id="loginNick" maxlength="24" placeholder="频道里显示的名字" autocomplete="nickname" hidden />
     <label for="loginPass">密码</label>
     <input id="loginPass" type="password" maxlength="128" placeholder="密码" autocomplete="current-password" />
     <button id="loginBtn" class="btn-primary">登录</button>
     <p id="loginError" class="lobby-error" hidden></p>
-    <p class="lobby-hint">账号由管理员分配,不支持自助注册。</p>
+    <p class="lobby-hint"><a href="#" id="modeToggle">没有账号?注册一个</a></p>
+    <p class="lobby-hint" id="regHint" hidden>新账号默认没有共享屏幕/摄像头的权限,需管理员开启后才能共享。</p>
   </div>
 </section>
 

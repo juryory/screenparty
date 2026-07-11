@@ -1,6 +1,7 @@
 // ScreenParty — 信令服务 (Cloudflare Worker + Durable Object)
 // 媒体流走 WebRTC mesh 点对点传输,本服务只负责:
-//   1. 鉴权     账号登录 / 会话 / 管理员用户管理(禁止匿名与自助注册)
+//   1. 鉴权     账号登录 / 自助注册 / 会话 / 管理员用户管理(禁止匿名;
+//               新注册账号默认无共享屏幕/摄像头权限,由管理员开启)
 //   2. /ws/:room   房间信令 (join / signal 转发 / 成员状态广播)
 //   3. /api/turn   可选:签发 TURN 临时凭证(自建 coturn / Cloudflare Realtime)
 //   4. 其余路径    静态前端 (public/)
@@ -73,13 +74,14 @@ function newId() {
   return crypto.randomUUID().replace(/-/g, '').slice(0, 10);
 }
 
-// 只对外暴露安全字段,绝不含 pw_hash / pw_salt
+// 只对外暴露安全字段,绝不含 pw_hash / pw_salt。管理员天然有共享权限。
 function publicUser(row) {
   return {
     username: row.username,
     nickname: row.nickname,
     isAdmin: !!row.is_admin,
     enabled: !!row.enabled,
+    canShare: !!row.can_share || !!row.is_admin,
     createdAt: row.created_at,
   };
 }
@@ -118,6 +120,15 @@ export default {
       if (!res) {
         return Response.json({ error: '用户名或密码错误,或账号已停用' }, { status: 401 });
       }
+      return Response.json({ user: res.user }, { headers: { 'Set-Cookie': sessionCookie(res.token) } });
+    }
+
+    // 自助注册:创建普通账号(无共享权限)并直接登录
+    if (url.pathname === '/api/register' && request.method === 'POST') {
+      const body = await request.json().catch(() => ({}));
+      const r = await auth.register(body);
+      if (!r.ok) return Response.json({ error: r.error }, { status: r.status || 400 });
+      const res = await auth.login(String(body.username || ''), String(body.password || ''));
       return Response.json({ user: res.user }, { headers: { 'Set-Cookie': sessionCookie(res.token) } });
     }
 
@@ -167,6 +178,7 @@ export default {
       const headers = new Headers(request.headers);
       headers.set('X-SP-Nick', encodeURIComponent(user.nickname)); // 覆盖任何客户端伪造值
       headers.set('X-SP-User', user.username);
+      headers.set('X-SP-Share', user.canShare ? '1' : '0'); // 共享权限,Room 据此拦截无权者的共享广播
       const id = env.ROOM.idFromName(wsMatch[1]);
       return env.ROOM.get(id).fetch(new Request(request, { headers }));
     }
@@ -347,8 +359,15 @@ export class Auth extends DurableObject {
         pw_salt    TEXT NOT NULL,
         is_admin   INTEGER NOT NULL DEFAULT 0,
         enabled    INTEGER NOT NULL DEFAULT 1,
+        can_share  INTEGER NOT NULL DEFAULT 0,
         created_at INTEGER NOT NULL
       )`);
+      // 迁移:旧库补 can_share 列。存量用户都是管理员手工建的可信小圈子,保留其共享能力;
+      // 新库建表时已含该列,ALTER 抛错跳过,不会误放行。
+      try {
+        this.sql.exec('ALTER TABLE users ADD COLUMN can_share INTEGER NOT NULL DEFAULT 0');
+        this.sql.exec('UPDATE users SET can_share = 1');
+      } catch {}
       this.sql.exec(`CREATE TABLE IF NOT EXISTS sessions (
         token      TEXT PRIMARY KEY,
         username   TEXT NOT NULL,
@@ -368,7 +387,7 @@ export class Auth extends DurableObject {
     const { salt, hash } = await hashPassword(password);
     const nickname = this.env.ADMIN_NICKNAME || username;
     this.sql.exec(
-      'INSERT INTO users (username, nickname, pw_hash, pw_salt, is_admin, enabled, created_at) VALUES (?, ?, ?, ?, 1, 1, ?)',
+      'INSERT INTO users (username, nickname, pw_hash, pw_salt, is_admin, enabled, can_share, created_at) VALUES (?, ?, ?, ?, 1, 1, 1, ?)',
       username,
       nickname,
       hash,
@@ -409,12 +428,17 @@ export class Auth extends DurableObject {
 
   async listUsers() {
     return this.sql
-      .exec('SELECT username, nickname, is_admin, enabled, created_at FROM users ORDER BY is_admin DESC, created_at ASC')
+      .exec('SELECT username, nickname, is_admin, enabled, can_share, created_at FROM users ORDER BY is_admin DESC, created_at ASC')
       .toArray()
       .map(publicUser);
   }
 
-  async createUser({ username, nickname, password, enabled } = {}) {
+  // 自助注册:强制普通用户 + 无共享权限(需管理员后台开启)
+  async register({ username, nickname, password } = {}) {
+    return this.createUser({ username, nickname, password, enabled: true, canShare: false });
+  }
+
+  async createUser({ username, nickname, password, enabled, canShare } = {}) {
     username = String(username || '').trim();
     nickname = String(nickname || '').trim().slice(0, 24);
     password = String(password || '');
@@ -427,18 +451,19 @@ export class Auth extends DurableObject {
     if (dup.length) return { ok: false, status: 409, error: '用户名已存在' };
     const { salt, hash } = await hashPassword(password);
     this.sql.exec(
-      'INSERT INTO users (username, nickname, pw_hash, pw_salt, is_admin, enabled, created_at) VALUES (?, ?, ?, ?, 0, ?, ?)',
+      'INSERT INTO users (username, nickname, pw_hash, pw_salt, is_admin, enabled, can_share, created_at) VALUES (?, ?, ?, ?, 0, ?, ?, ?)',
       username,
       nickname,
       hash,
       salt,
       enabled === false ? 0 : 1,
+      canShare ? 1 : 0,
       Date.now(),
     );
     return { ok: true };
   }
 
-  async updateUser(username, { nickname, password, enabled } = {}) {
+  async updateUser(username, { nickname, password, enabled, canShare } = {}) {
     const user = this.sql.exec('SELECT * FROM users WHERE username = ?', username).toArray()[0];
     if (!user) return { ok: false, status: 404, error: '用户不存在' };
     if (user.is_admin && enabled === false) {
@@ -458,6 +483,9 @@ export class Auth extends DurableObject {
       this.sql.exec('UPDATE users SET enabled = ? WHERE username = ?', enabled ? 1 : 0, username);
       // 停用即踢下线:清掉其现有会话
       if (!enabled) this.sql.exec('DELETE FROM sessions WHERE username = ?', username);
+    }
+    if (canShare !== undefined) {
+      this.sql.exec('UPDATE users SET can_share = ? WHERE username = ?', canShare ? 1 : 0, username);
     }
     return { ok: true };
   }
@@ -648,12 +676,13 @@ export class Room {
     if (peers.length >= MAX_PEERS) {
       return new Response('room full', { status: 409 });
     }
-    // 可信昵称由 Worker 鉴权后注入,客户端无法伪造
+    // 可信昵称/权限由 Worker 鉴权后注入,客户端无法伪造
     const nick = decodeURIComponent(request.headers.get('X-SP-Nick') || '') || '玩家';
+    const canShare = request.headers.get('X-SP-Share') === '1';
     const pair = new WebSocketPair();
     // Hibernation API:空闲时 DO 休眠,不消耗运行时配额
     this.state.acceptWebSocket(pair[1]);
-    pair[1].serializeAttachment({ nick });
+    pair[1].serializeAttachment({ nick, canShare });
     return new Response(null, { status: 101, webSocket: pair[0] });
   }
 
@@ -670,13 +699,13 @@ export class Room {
         const att = ws.deserializeAttachment() || {};
         const id = crypto.randomUUID().slice(0, 8);
         const name = att.nick || '玩家'; // 用服务端可信昵称,忽略 msg.name
-        ws.serializeAttachment({ id, name, sharing: false });
+        ws.serializeAttachment({ id, name, canShare: !!att.canShare, sharing: false, camera: false });
 
         // 告知新人:自己的 id + 房间里已有哪些人(新人将向他们逐一发起连接)
         const others = this.roster().filter((p) => p.id !== id);
         ws.send(JSON.stringify({ type: 'welcome', id, peers: others }));
 
-        this.broadcast({ type: 'peer-joined', peer: { id, name, sharing: false } }, ws);
+        this.broadcast({ type: 'peer-joined', peer: { id, name, sharing: false, camera: false } }, ws);
         break;
       }
 
@@ -694,13 +723,14 @@ export class Room {
       }
 
       case 'state': {
-        // 共享开始/结束等状态,广播给全房间
+        // 共享屏幕/摄像头状态,广播给全房间;无共享权限的账号一律压成 false
         const me = ws.deserializeAttachment();
         if (!me || !me.id) return;
-        me.sharing = !!msg.sharing;
+        if ('sharing' in msg) me.sharing = !!msg.sharing && !!me.canShare;
+        if ('camera' in msg) me.camera = !!msg.camera && !!me.canShare;
         ws.serializeAttachment(me);
         this.broadcast(
-          { type: 'peer-state', id: me.id, sharing: me.sharing },
+          { type: 'peer-state', id: me.id, sharing: me.sharing, camera: !!me.camera },
           ws,
         );
         break;
@@ -728,7 +758,8 @@ export class Room {
     return this.state
       .getWebSockets()
       .map((s) => s.deserializeAttachment())
-      .filter((a) => a && a.id);
+      .filter((a) => a && a.id)
+      .map((a) => ({ id: a.id, name: a.name, sharing: !!a.sharing, camera: !!a.camera }));
   }
 
   broadcast(obj, except) {

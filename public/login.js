@@ -19,26 +19,41 @@ function go() {
   location.replace(room ? `/?room=${encodeURIComponent(room)}` : '/');
 }
 
-$('loginBtn').addEventListener('click', doLogin);
-[$('loginUser'), $('loginPass')].forEach((el) =>
-  el.addEventListener('keydown', (e) => e.key === 'Enter' && doLogin()),
+// 登录 / 注册模式切换
+let registering = false;
+$('modeToggle').addEventListener('click', (e) => {
+  e.preventDefault();
+  registering = !registering;
+  $('nickLabel').hidden = $('loginNick').hidden = !registering;
+  $('regHint').hidden = !registering;
+  $('brandSub').textContent = registering ? '注册新账号' : '请使用账号登录';
+  $('loginBtn').textContent = registering ? '注册并进入' : '登录';
+  $('modeToggle').textContent = registering ? '已有账号?去登录' : '没有账号?注册一个';
+  showError('');
+});
+
+$('loginBtn').addEventListener('click', doSubmit);
+[$('loginUser'), $('loginNick'), $('loginPass')].forEach((el) =>
+  el.addEventListener('keydown', (e) => e.key === 'Enter' && doSubmit()),
 );
 
-async function doLogin() {
+async function doSubmit() {
   const username = $('loginUser').value.trim();
   const password = $('loginPass').value;
+  const nickname = $('loginNick').value.trim();
   if (!username || !password) return showError('请输入用户名和密码');
+  if (registering && !nickname) return showError('请填写显示昵称');
   $('loginBtn').disabled = true;
   showError('');
   try {
-    const r = await fetch('/api/login', {
+    const r = await fetch(registering ? '/api/register' : '/api/login', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ username, password }),
+      body: JSON.stringify(registering ? { username, nickname, password } : { username, password }),
     });
     const j = await r.json().catch(() => ({}));
     if (!r.ok) {
-      showError(j.error || '登录失败');
+      showError(j.error || (registering ? '注册失败' : '登录失败'));
       $('loginBtn').disabled = false;
       return;
     }

@@ -1,7 +1,7 @@
 // ScreenParty 前端 — WebRTC full mesh
 //
-// 连接模型:每对成员一条 RTCPeerConnection,固定 3 个 transceiver:
-//   [0] mic 音频  [1] 屏幕视频  [2] 屏幕音频(游戏声)
+// 连接模型:每对成员一条 RTCPeerConnection,固定 4 个 transceiver:
+//   [0] mic 音频  [1] 屏幕视频  [2] 屏幕音频(游戏声)  [3] 摄像头视频
 // 建连时一次性协商好全部 m-line,之后开/关共享只 replaceTrack,不重协商。
 // 新加入者作为发起方,向房间内每个已有成员发 offer,天然无 glare。
 
@@ -15,14 +15,16 @@ const state = {
   myName: '',
   myUser: '',
   role: 'member',
+  canShare: false, // 共享屏幕/摄像头权限(管理员后台开启)
   channelId: null,
   channelName: '',
   guild: null, // { guild:{name,icon,description}, categories:[], channels:[], me:{role} }
   iceServers: [{ urls: 'stun:stun.cloudflare.com:3478' }],
   micTrack: null,
   screenStream: null,
-  peers: new Map(), // id -> { name, sharing, pc, senders, tile, videoStream, audioEl, sendQuality, viewReq }
-  focusedId: null,  // 当前主舞台显示谁:peer id / 'local' / null
+  camStream: null,
+  peers: new Map(), // id -> { name, sharing, camera, pc, senders, tile, camTile, videoStream, camStream, audioEl, sendQuality, viewReq }
+  focusedId: null,  // 当前主舞台显示谁:peer id / id+':cam' / 'local' / 'local:cam' / null
 };
 
 const ROLE_LABEL = { owner: '所有者', admin: '管理员', member: '成员' };
@@ -30,6 +32,7 @@ const ROLE_LABEL = { owner: '所有者', admin: '管理员', member: '成员' };
 const SCREEN_MAX_BITRATE = 3_500_000; // ~3.5 Mbps,主窗口(被人放大观看)的全码率
 const THUMB_MAX_BITRATE = 300_000;    // 缩略图(没在主窗口看的共享)只发 ~300kbps
 const THUMB_SCALE = 3;                // 且分辨率降到 1/3,低码率下更耐看
+const CAM_MAX_BITRATE = 1_000_000;    // 摄像头固定 ~1 Mbps(人脸画面不需要屏幕那么高)
 
 // ---------- Safari 自动播放兜底 ----------
 // Safari 拦截带声 autoplay(play() 拒绝后连画面都不解码,表现为黑屏)。
@@ -70,12 +73,22 @@ async function bootstrapAuth() {
   if (!me) return location.replace('/login.html');
   state.myName = me.nickname;
   state.myUser = me.username;
+  state.canShare = !!me.canShare;
   $('app').hidden = false;
   $('uNick').textContent = me.nickname;
   $('uAvatar').textContent = me.nickname.slice(0, 2);
   $('adminLink').hidden = !me.isAdmin;
+  applyShareUi();
   await loadGuild();
   startStatsLoop();
+}
+
+// 无共享权限:按钮禁用并提示(服务端同样会拦截,这里只是界面反馈)
+function applyShareUi() {
+  for (const b of [$('shareBtn'), $('camBtn')]) {
+    b.disabled = !state.canShare;
+    b.title = state.canShare ? '' : '共享权限未开启,请联系管理员在用户管理中开启';
+  }
 }
 
 // 拉服务器结构(名称/图标/分类/频道/我的角色)并渲染频道列表
@@ -187,6 +200,7 @@ async function joinChannel(id, name, topic) {
   $('curTopic').textContent = topic || '';
   $('emptyMain').textContent = '还没有人在共享画面';
   applyMicUi();
+  startMeter();
   renderChannels();
   connectSignaling();
 }
@@ -198,15 +212,24 @@ function leaveChannel(rerender = true) {
     $('shareBtn').setAttribute('aria-pressed', 'false');
     $('shareBtn').querySelector('span').textContent = '共享屏幕';
   }
+  if (state.camStream) {
+    state.camStream.getTracks().forEach((t) => t.stop());
+    state.camStream = null;
+    camUi(false);
+  }
   for (const [, p] of state.peers) {
     clearTimeout(p.recoverTimer);
     p.pc?.close();
     p.audioEl && (p.audioEl.srcObject = null);
     p.tile?.remove();
+    p.camTile?.remove();
   }
   state.peers.clear();
   localTile?.remove();
   localTile = null;
+  localCamTile?.remove();
+  localCamTile = null;
+  stopMeter();
   try {
     state.ws?.close();
   } catch {}
@@ -245,6 +268,54 @@ $('micToggle').addEventListener('click', () => {
   applyMicUi();
 });
 
+// ---------- 麦克风电平表(-24dB ~ 0dB) ----------
+// WebAudio 采样本地麦克风算 RMS 转 dBFS;静音(track.enabled=false)时轨道输出静默,表自然回落。
+const meter = { ac: null, src: null, analyser: null, data: null, raf: 0 };
+
+function startMeter() {
+  if (!state.micTrack) return stopMeter();
+  try {
+    const AC = window.AudioContext || window.webkitAudioContext;
+    meter.ac ||= new AC();
+    meter.ac.resume?.().catch(() => {});
+    meter.src?.disconnect();
+    meter.analyser ||= meter.ac.createAnalyser();
+    meter.analyser.fftSize = 1024;
+    meter.src = meter.ac.createMediaStreamSource(new MediaStream([state.micTrack]));
+    meter.src.connect(meter.analyser); // 只分析不外放,不接 destination
+    meter.data ||= new Float32Array(meter.analyser.fftSize);
+    $('micMeter').hidden = false;
+    cancelAnimationFrame(meter.raf);
+    const tick = () => {
+      meter.analyser.getFloatTimeDomainData(meter.data);
+      let sum = 0;
+      for (let i = 0; i < meter.data.length; i++) sum += meter.data[i] * meter.data[i];
+      const db = 20 * Math.log10(Math.sqrt(sum / meter.data.length) || 1e-7);
+      const pct = Math.max(0, Math.min(1, (db + 24) / 24)); // -24dB→0%,0dB→100%
+      $('meterCover').style.left = (pct * 100).toFixed(1) + '%';
+      meter.raf = requestAnimationFrame(tick);
+    };
+    tick();
+  } catch {
+    stopMeter();
+  }
+}
+
+function stopMeter() {
+  cancelAnimationFrame(meter.raf);
+  meter.raf = 0;
+  meter.src?.disconnect();
+  meter.src = null;
+  $('meterCover').style.left = '0%';
+  $('micMeter').hidden = true;
+}
+
+// 记忆的设备偏好(设备设置弹窗保存);ideal 而非 exact:设备拔掉时自动回退默认
+function prefDevice(key) {
+  const id = localStorage.getItem(key);
+  return id ? { ideal: id } : undefined;
+}
+
 // 尝试获取麦克风;拿不到就返回 null(不阻塞进房)。
 // 关键:无麦克风的机器上 getUserMedia 可能长时间挂起而不报错,所以先探测设备并加超时兜底。
 async function acquireMic() {
@@ -253,7 +324,7 @@ async function acquireMic() {
     if (!devices.some((d) => d.kind === 'audioinput')) return null; // 没有麦克风设备,直接跳过
   } catch {}
   const micPromise = navigator.mediaDevices.getUserMedia({
-    audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+    audio: { deviceId: prefDevice('sp_micId'), echoCancellation: true, noiseSuppression: true, autoGainControl: true },
   });
   try {
     const stream = await Promise.race([
@@ -301,6 +372,7 @@ function connectSignaling() {
         const p = state.peers.get(msg.id);
         if (p) {
           p.sharing = msg.sharing;
+          p.camera = !!msg.camera;
           refreshTiles();
         }
         break;
@@ -327,6 +399,7 @@ function createPeerConnection(peerId) {
   const pc = new RTCPeerConnection({ iceServers: state.iceServers });
   peer.pc = pc;
   peer.videoStream = new MediaStream();
+  peer.camStream = new MediaStream();
 
   pc.onicecandidate = (e) => {
     if (e.candidate) sendSignal(peerId, { ice: e.candidate });
@@ -340,6 +413,18 @@ function createPeerConnection(peerId) {
       peer.audioEl.autoplay = true;
       peer.audioEl.srcObject = new MediaStream([e.track]);
       safePlay(peer.audioEl);
+    } else if (idx === 3) {
+      // 对方摄像头
+      peer.camStream.addTrack(e.track);
+      const oldTile = peer.camTile;
+      refreshTiles();
+      if (peer.camTile && peer.camTile === oldTile) {
+        const v = peer.camTile.querySelector('video');
+        if (v) {
+          v.srcObject = peer.camStream;
+          safePlay(v);
+        }
+      }
     } else {
       // 对方屏幕(视频 + 游戏声),合入同一条流保证音画同步
       peer.videoStream.addTrack(e.track);
@@ -412,15 +497,18 @@ function setupTransceivers(pc, asOfferer) {
     const mic = pc.addTransceiver(state.micTrack || 'audio', { direction: 'sendrecv' });
     const video = pc.addTransceiver('video', { direction: 'sendrecv' });
     const audio = pc.addTransceiver('audio', { direction: 'sendrecv' });
+    const cam = pc.addTransceiver('video', { direction: 'sendrecv' });
     preferH264(video);
-    return { mic: mic.sender, video: video.sender, screenAudio: audio.sender };
+    preferH264(cam);
+    return { mic: mic.sender, video: video.sender, screenAudio: audio.sender, camera: cam.sender };
   }
-  // answer 端:transceiver 由远端 offer 创建,按相同顺序取用
-  const [mic, video, audio] = pc.getTransceivers();
-  [mic, video, audio].forEach((t) => (t.direction = 'sendrecv'));
+  // answer 端:transceiver 由远端 offer 创建,按相同顺序取用(cam 兜底:对面是旧版页面时只有 3 条)
+  const [mic, video, audio, cam] = pc.getTransceivers();
+  [mic, video, audio, cam].filter(Boolean).forEach((t) => (t.direction = 'sendrecv'));
   mic.sender.replaceTrack(state.micTrack);
   preferH264(video);
-  return { mic: mic.sender, video: video.sender, screenAudio: audio.sender };
+  if (cam) preferH264(cam);
+  return { mic: mic.sender, video: video.sender, screenAudio: audio.sender, camera: cam?.sender };
 }
 
 function preferH264(transceiver) {
@@ -442,6 +530,7 @@ async function makeOffer(peerId) {
   const pc = createPeerConnection(peerId);
   peer.senders = setupTransceivers(pc, true);
   await attachScreenTo(peer); // 若自己已在共享,直接带上
+  await attachCameraTo(peer);
   const offer = await pc.createOffer();
   await pc.setLocalDescription(offer);
   sendSignal(peerId, { sdp: pc.localDescription });
@@ -474,6 +563,7 @@ async function handleSignal(from, data) {
         // 仅首次建连时建立 transceiver / 附加屏幕;ICE 重启的 offer 只需重新应答
         peer.senders = setupTransceivers(pc, false);
         await attachScreenTo(peer);
+        await attachCameraTo(peer);
       }
       const answer = await pc.createAnswer();
       await pc.setLocalDescription(answer);
@@ -512,10 +602,15 @@ async function startShare() {
 
   for (const peer of state.peers.values()) await attachScreenTo(peer);
 
-  state.ws?.send(JSON.stringify({ type: 'state', sharing: true }));
+  sendState();
   $('shareBtn').setAttribute('aria-pressed', 'true');
   $('shareBtn').querySelector('span').textContent = '停止共享';
   refreshTiles();
+}
+
+// 共享屏幕/摄像头状态上报(服务端会对无权限账号强制压成 false)
+function sendState() {
+  state.ws?.send(JSON.stringify({ type: 'state', sharing: !!state.screenStream, camera: !!state.camStream }));
 }
 
 async function attachScreenTo(peer) {
@@ -549,10 +644,59 @@ function stopShare() {
     peer.senders?.video.replaceTrack(null);
     peer.senders?.screenAudio.replaceTrack(null);
   }
-  state.ws?.send(JSON.stringify({ type: 'state', sharing: false }));
+  sendState();
   $('shareBtn').setAttribute('aria-pressed', 'false');
   $('shareBtn').querySelector('span').textContent = '共享屏幕';
   refreshTiles();
+}
+
+// ---------- 摄像头 ----------
+
+$('camBtn').addEventListener('click', () =>
+  state.camStream ? stopCamera() : startCamera(),
+);
+
+async function startCamera() {
+  let stream;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      video: { deviceId: prefDevice('sp_camId'), width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 } },
+      audio: false,
+    });
+  } catch {
+    return; // 拒绝授权 / 无摄像头
+  }
+  state.camStream = stream;
+  stream.getVideoTracks()[0].onended = stopCamera;
+  for (const peer of state.peers.values()) await attachCameraTo(peer);
+  sendState();
+  camUi(true);
+  refreshTiles();
+}
+
+function stopCamera() {
+  state.camStream?.getTracks().forEach((t) => t.stop());
+  state.camStream = null;
+  for (const peer of state.peers.values()) peer.senders?.camera?.replaceTrack(null);
+  sendState();
+  camUi(false);
+  refreshTiles();
+}
+
+function camUi(on) {
+  $('camBtn').setAttribute('aria-pressed', String(on));
+  $('camBtn').querySelector('span').textContent = on ? '关摄像头' : '摄像头';
+}
+
+async function attachCameraTo(peer) {
+  if (!peer.senders?.camera || !state.camStream) return;
+  const vt = state.camStream.getVideoTracks()[0];
+  if (!vt) return;
+  await peer.senders.camera.replaceTrack(vt);
+  const p = peer.senders.camera.getParameters();
+  if (!p.encodings?.length) p.encodings = [{}];
+  p.encodings[0].maxBitrate = CAM_MAX_BITRATE;
+  peer.senders.camera.setParameters(p).catch(() => {});
 }
 
 // ---------- 麦克风 / 离开 ----------
@@ -562,7 +706,7 @@ $('leaveBtn').addEventListener('click', () => leaveChannel());
 // ---------- 成员与画面渲染 ----------
 
 function addPeer(p) {
-  state.peers.set(p.id, { name: p.name, sharing: !!p.sharing, videoStream: null });
+  state.peers.set(p.id, { name: p.name, sharing: !!p.sharing, camera: !!p.camera, videoStream: null, camStream: null });
   renderMembers();
   refreshTiles();
 }
@@ -573,6 +717,7 @@ function removePeer(id) {
   peer.pc?.close();
   peer.audioEl && (peer.audioEl.srcObject = null);
   peer.tile?.remove();
+  peer.camTile?.remove();
   state.peers.delete(id);
   renderMembers();
   refreshTiles();
@@ -582,7 +727,7 @@ function renderMembers() {
   const box = document.getElementById('channelMembers');
   if (!box) return;
   box.innerHTML = '';
-  const add = (name, sharing, isMe) => {
+  const add = (name, sharing, isMe, camera) => {
     const el = document.createElement('div');
     el.className = 'cm-row';
     el.classList.toggle('is-sharing', !!sharing);
@@ -592,13 +737,20 @@ function renderMembers() {
     nm.className = 'cm-name';
     nm.textContent = isMe ? `${name}(我)` : name;
     el.append(dot, nm);
+    if (camera) {
+      const cam = document.createElement('span');
+      cam.className = 'cm-cam';
+      cam.textContent = '📷';
+      el.appendChild(cam);
+    }
     box.appendChild(el);
   };
-  if (state.channelId) add(state.myName, !!state.screenStream, true);
-  for (const p of state.peers.values()) add(p.name, p.sharing, false);
+  if (state.channelId) add(state.myName, !!state.screenStream, true, !!state.camStream);
+  for (const p of state.peers.values()) add(p.name, p.sharing, false, p.camera);
 }
 
 let localTile = null;
+let localCamTile = null;
 
 // 演讲者视图:焦点那块进主舞台(#stage),其余(含未共享成员的占位块)进右侧胶片栏(#rail)。
 function refreshTiles() {
@@ -614,20 +766,40 @@ function refreshTiles() {
     localTile = null;
   }
 
-  // 每个成员一块瓦片:正在共享→视频瓦片;未共享→占位瓦片。共享状态切换时换瓦片类型。
+  // 本地摄像头预览瓦片(镜像显示)
+  if (state.camStream && !localCamTile) {
+    localCamTile = makeCamTile(`${state.myName}(我)`, state.camStream, 'local:cam');
+    localCamTile.classList.add('is-cam-local');
+  } else if (!state.camStream && localCamTile) {
+    if (state.focusedId === 'local:cam') state.focusedId = null;
+    localCamTile.remove();
+    localCamTile = null;
+  }
+
+  // 每个成员:屏幕瓦片(共享中)+ 摄像头瓦片(开镜头)各自独立;两者皆无才放占位瓦片
   for (const [id, p] of state.peers) {
     const hasVideo = p.sharing && p.videoStream?.getVideoTracks().length;
-    const kind = hasVideo ? 'video' : 'placeholder';
+    const hasCam = p.camera && p.camStream?.getVideoTracks().length;
+
+    if (hasCam && !p.camTile) {
+      p.camTile = makeCamTile(p.name, p.camStream, id + ':cam');
+    } else if (!hasCam && p.camTile) {
+      if (state.focusedId === id + ':cam') state.focusedId = null;
+      p.camTile.remove();
+      p.camTile = null;
+    }
+
+    const kind = hasVideo ? 'video' : hasCam ? null : 'placeholder';
     if (p.tile && p.tileKind !== kind) {
       p.tile.remove();
       p.tile = null;
     }
-    if (!p.tile) {
-      p.tile = hasVideo
+    if (kind && !p.tile) {
+      p.tile = kind === 'video'
         ? makeTile(p.name, p.videoStream, false, id)
         : makePlaceholder(p.name, id);
-      p.tileKind = kind;
     }
+    p.tileKind = kind;
   }
 
   // 焦点失效(那块没了)则自动挑一个:优先别人的共享,其次自己的共享,再没有就留空
@@ -652,14 +824,22 @@ function refreshTiles() {
 function collectTiles() {
   const m = new Map();
   if (localTile) m.set('local', localTile);
-  for (const [id, p] of state.peers) if (p.tile) m.set(id, p.tile);
+  if (localCamTile) m.set('local:cam', localCamTile);
+  for (const [id, p] of state.peers) {
+    if (p.tile) m.set(id, p.tile);
+    if (p.camTile) m.set(id + ':cam', p.camTile);
+  }
   return m;
 }
 
+// 默认焦点优先级:别人的屏幕 > 自己的屏幕 > 别人的摄像头 > 自己的摄像头
 function pickDefaultFocus() {
   for (const [id, p] of state.peers)
     if (p.sharing && p.videoStream?.getVideoTracks().length) return id;
   if (state.screenStream) return 'local';
+  for (const [id, p] of state.peers)
+    if (p.camera && p.camStream?.getVideoTracks().length) return id + ':cam';
+  if (state.camStream) return 'local:cam';
   return null;
 }
 
@@ -697,6 +877,13 @@ function makeTile(name, stream, muted, key) {
   return tile;
 }
 
+// 摄像头瓦片:无音轨(声音走 mic 那路),静音以确保各浏览器自动播放
+function makeCamTile(name, stream, key) {
+  const tile = makeTile(name, stream, true, key);
+  tile.querySelector('.umd-tally').textContent = 'CAM';
+  return tile;
+}
+
 function makePlaceholder(name, key) {
   const tile = $('tileTemplate').content.firstElementChild.cloneNode(true);
   tile.classList.add('is-placeholder');
@@ -715,25 +902,29 @@ function makePlaceholder(name, key) {
 // ---------- 实时统计(分辨率 / fps / 码率) ----------
 
 function startStatsLoop() {
-  const last = new Map(); // pc -> bytes
+  const last = new Map(); // peerId+mid / 'local' -> bytes
   setInterval(async () => {
     for (const [id, p] of state.peers) {
-      if (!p.pc || !p.tile) continue;
+      if (!p.pc || (!p.tile && !p.camTile)) continue;
       try {
         const stats = await p.pc.getStats();
         stats.forEach((s) => {
           if (s.type === 'inbound-rtp' && s.kind === 'video') {
-            const prev = last.get(p.pc) || 0;
+            // 一条连接里有两路视频:按 m-line 序号区分(1=屏幕,3=摄像头;旧端无 mid 按屏幕算)
+            const isCam = s.mid === '3';
+            const tile = isCam ? p.camTile : p.tile;
+            const key = id + ':' + (s.mid ?? 'v');
+            const prev = last.get(key) || 0;
             const delta = s.bytesReceived - prev;
             const kbps = Math.round((delta * 8) / 2000);
-            last.set(p.pc, s.bytesReceived);
-            const statsEl = p.tile.querySelector('.tile-stats');
+            last.set(key, s.bytesReceived);
+            const statsEl = tile?.querySelector('.tile-stats');
             if (statsEl)
               statsEl.textContent =
                 `${s.frameWidth || '?'}×${s.frameHeight || '?'} ` +
                 `${s.framesPerSecond || 0}fps ${kbps}kbps`;
-            // 卡死自愈兜底:对方在共享却连续多轮零字节(ICE 仍显示 connected 的僵死),强制重连
-            if (p.sharing) {
+            // 卡死自愈兜底:对方在共享屏幕却连续多轮零字节(ICE 仍显示 connected 的僵死),强制重连
+            if (!isCam && p.sharing) {
               if (delta <= 0) {
                 p.stallTicks = (p.stallTicks || 0) + 1;
                 if (p.stallTicks >= 8) { p.stallTicks = 0; triggerRestart(id); } // ~16s 无数据
@@ -1046,6 +1237,101 @@ async function openMembers() {
   }
   if (!(r.data.members || []).length) body.textContent = '暂无成员';
   openModal('成员与角色', body, null, '完成');
+}
+
+// ---------- 设备选择(麦克风 / 摄像头) ----------
+
+$('deviceBtn').addEventListener('click', () => {
+  $('userMenu').hidden = true;
+  openDeviceSettings();
+});
+
+async function openDeviceSettings() {
+  let devices = [];
+  try {
+    devices = await navigator.mediaDevices.enumerateDevices();
+  } catch {}
+
+  const mkSel = (kind, savedKey, fallbackLabel) => {
+    const s = document.createElement('select');
+    s.className = 'field-input';
+    const def = document.createElement('option');
+    def.value = '';
+    def.textContent = '系统默认';
+    s.appendChild(def);
+    const saved = localStorage.getItem(savedKey) || '';
+    let i = 0;
+    for (const d of devices.filter((d) => d.kind === kind && d.deviceId)) {
+      i++;
+      const o = document.createElement('option');
+      o.value = d.deviceId;
+      o.textContent = d.label || `${fallbackLabel} ${i}`;
+      if (d.deviceId === saved) o.selected = true;
+      s.appendChild(o);
+    }
+    return s;
+  };
+
+  const micSel = mkSel('audioinput', 'sp_micId', '麦克风');
+  const camSel = mkSel('videoinput', 'sp_camId', '摄像头');
+  const body = document.createElement('div');
+  body.append(field('麦克风', micSel), field('摄像头', camSel));
+  if (devices.length && devices.every((d) => !d.label)) {
+    const tip = document.createElement('p');
+    tip.className = 'confirm-msg';
+    tip.textContent = '提示:进过一次频道(授权麦克风/摄像头)后,这里才能显示设备名称。';
+    body.appendChild(tip);
+  }
+
+  openModal('音频视频设备', body, async () => {
+    const micChanged = micSel.value !== (localStorage.getItem('sp_micId') || '');
+    const camChanged = camSel.value !== (localStorage.getItem('sp_camId') || '');
+    micSel.value ? localStorage.setItem('sp_micId', micSel.value) : localStorage.removeItem('sp_micId');
+    camSel.value ? localStorage.setItem('sp_camId', camSel.value) : localStorage.removeItem('sp_camId');
+    // 正在用的设备热切换:重新采集 + replaceTrack,不断连不重协商
+    if (micChanged && state.micTrack) await switchMic();
+    if (camChanged && state.camStream) await switchCamera();
+  }, '保存');
+}
+
+async function switchMic() {
+  const wasMuted = !state.micTrack.enabled;
+  const old = state.micTrack;
+  state.micTrack = null; // 先置空,acquireMic 失败时保持"无麦"状态
+  const fresh = await acquireMic();
+  if (!fresh) {
+    state.micTrack = old; // 新设备拿不到,退回旧轨道
+    applyMicUi();
+    return;
+  }
+  fresh.enabled = !wasMuted;
+  state.micTrack = fresh;
+  old?.stop();
+  for (const p of state.peers.values()) p.senders?.mic?.replaceTrack(fresh);
+  applyMicUi();
+  if (state.channelId) startMeter();
+}
+
+async function switchCamera() {
+  let stream;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      video: { deviceId: prefDevice('sp_camId'), width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 } },
+      audio: false,
+    });
+  } catch {
+    return; // 新摄像头拿不到,保持原样
+  }
+  const old = state.camStream;
+  state.camStream = stream;
+  stream.getVideoTracks()[0].onended = stopCamera;
+  for (const p of state.peers.values()) await attachCameraTo(p);
+  old?.getTracks().forEach((t) => t.stop());
+  if (localCamTile) {
+    const v = localCamTile.querySelector('video');
+    v.srcObject = stream;
+    safePlay(v);
+  }
 }
 
 // ---------- 加入/离开提示音(阶段 4) ----------

@@ -49,13 +49,20 @@ function renderUsers(users) {
     statusCell.appendChild(badge);
     tr.appendChild(statusCell);
 
+    const shareCell = document.createElement('td');
+    const shareBadge = document.createElement('span');
+    shareBadge.className = 'badge ' + (u.canShare ? 'badge-on' : 'badge-off');
+    shareBadge.textContent = u.canShare ? '允许' : '未开';
+    shareCell.appendChild(shareBadge);
+    tr.appendChild(shareCell);
+
     tr.appendChild(actionCell(u));
     tbody.appendChild(tr);
   }
   if (!users.length) {
     const tr = document.createElement('tr');
     const td = document.createElement('td');
-    td.colSpan = 5;
+    td.colSpan = 6;
     td.className = 'admin-empty';
     td.textContent = '暂无用户';
     tr.appendChild(td);
@@ -90,6 +97,12 @@ function actionCell(u) {
   td.appendChild(pwBtn);
 
   if (!u.isAdmin) {
+    // 共享权限开关(注册用户默认关,由这里开启)
+    const share = opBtn(u.canShare ? '关闭共享' : '开启共享', async () => {
+      await patchUser(u.username, { canShare: !u.canShare });
+    });
+    td.appendChild(share);
+
     // 启用/停用
     const toggle = opBtn(u.enabled ? '停用' : '启用', async () => {
       await patchUser(u.username, { enabled: !u.enabled });
@@ -125,6 +138,7 @@ $('createForm').addEventListener('submit', async (e) => {
     nickname: $('cNick').value.trim(),
     password: $('cPass').value,
     enabled: $('cEnabled').checked,
+    canShare: $('cShare').checked,
   };
   try {
     const r = await fetch('/api/admin/users', {
@@ -137,6 +151,7 @@ $('createForm').addEventListener('submit', async (e) => {
     showMsg('createMsg', '创建成功', false);
     $('createForm').reset();
     $('cEnabled').checked = true;
+    $('cShare').checked = true;
     loadUsers();
   } catch {
     showMsg('createMsg', '网络错误', true);
