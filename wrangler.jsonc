@@ -13,13 +13,16 @@
     "bindings": [
       { "name": "ROOM", "class_name": "Room" },
       // 单例账号/会话存储(idFromName("global")):用户表 + 会话表
-      { "name": "AUTH", "class_name": "Auth" }
+      { "name": "AUTH", "class_name": "Auth" },
+      // 单例服务器结构(idFromName("global")):分类 / 频道 / 成员角色
+      { "name": "GUILD", "class_name": "Guild" }
     ]
   },
   "migrations": [
     // SQLite-backed DO:Workers 免费计划即可使用
     { "tag": "v1", "new_sqlite_classes": ["Room"] },
-    { "tag": "v2", "new_sqlite_classes": ["Auth"] }
+    { "tag": "v2", "new_sqlite_classes": ["Auth"] },
+    { "tag": "v3", "new_sqlite_classes": ["Guild"] }
   ]
   // 鉴权:首次访问时用下列 secret 自动创建管理员账号(不进代码库)
   //   wrangler secret put ADMIN_USERNAME

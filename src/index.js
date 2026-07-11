@@ -68,6 +68,11 @@ async function verifyPassword(password, saltHex, expectedHash) {
   return diff === 0;
 }
 
+// 短随机 id(分类/频道用)
+function newId() {
+  return crypto.randomUUID().replace(/-/g, '').slice(0, 10);
+}
+
 // 只对外暴露安全字段,绝不含 pw_hash / pw_salt
 function publicUser(row) {
   return {
@@ -126,6 +131,20 @@ export default {
       const user = await auth.verify(getCookie(request, SESSION_COOKIE));
       if (!user) return Response.json({ error: 'unauthorized' }, { status: 401 });
       return Response.json({ user });
+    }
+
+    // 服务器(单例):树 / 设置 / 分类 / 频道 / 成员角色(需登录)
+    if (
+      url.pathname === '/api/guild' ||
+      url.pathname.startsWith('/api/categories') ||
+      url.pathname.startsWith('/api/channels') ||
+      url.pathname === '/api/members' ||
+      url.pathname.startsWith('/api/members/')
+    ) {
+      const user = await auth.verify(getCookie(request, SESSION_COOKIE));
+      if (!user) return Response.json({ error: 'unauthorized' }, { status: 401 });
+      const guild = env.GUILD.get(env.GUILD.idFromName('global'));
+      return this.guildApi(request, url, guild, auth, user);
     }
 
     // 管理员:用户增删改查(需登录且 isAdmin)
@@ -193,6 +212,67 @@ export default {
         status: r.ok ? 200 : r.status || 400,
       });
     }
+    return new Response('method not allowed', { status: 405 });
+  },
+
+  // 服务器结构 API:GET 树对所有登录者开放;增删改需 owner/admin;改角色需 owner
+  async guildApi(request, url, guild, auth, user) {
+    const method = request.method;
+    const role = await guild.roleOf(user.username);
+    const canManage = role === 'owner' || role === 'admin';
+    const forbidden = () => Response.json({ error: 'forbidden' }, { status: 403 });
+    const done = (r) =>
+      Response.json(r.ok ? { ok: true, id: r.id } : { error: r.error }, { status: r.ok ? 200 : r.status || 400 });
+    const body = () => request.json().catch(() => ({}));
+
+    // 整棵树 + 我的角色
+    if (url.pathname === '/api/guild' && method === 'GET') {
+      return Response.json({
+        ...(await guild.tree()),
+        me: { username: user.username, nickname: user.nickname, role },
+      });
+    }
+    if (url.pathname === '/api/guild' && method === 'PATCH') {
+      if (!canManage) return forbidden();
+      return done(await guild.updateGuild(await body()));
+    }
+
+    // 分类
+    if (url.pathname === '/api/categories' && method === 'POST') {
+      if (!canManage) return forbidden();
+      return done(await guild.createCategory(await body()));
+    }
+    if (url.pathname.startsWith('/api/categories/')) {
+      if (!canManage) return forbidden();
+      const id = decodeURIComponent(url.pathname.slice('/api/categories/'.length));
+      if (method === 'PATCH') return done(await guild.updateCategory(id, await body()));
+      if (method === 'DELETE') return done(await guild.deleteCategory(id));
+    }
+
+    // 频道
+    if (url.pathname === '/api/channels' && method === 'POST') {
+      if (!canManage) return forbidden();
+      return done(await guild.createChannel(await body()));
+    }
+    if (url.pathname.startsWith('/api/channels/')) {
+      if (!canManage) return forbidden();
+      const id = decodeURIComponent(url.pathname.slice('/api/channels/'.length));
+      if (method === 'PATCH') return done(await guild.updateChannel(id, await body()));
+      if (method === 'DELETE') return done(await guild.deleteChannel(id));
+    }
+
+    // 成员与角色(合并账号列表 + 服务器角色)
+    if (url.pathname === '/api/members' && method === 'GET') {
+      const users = await auth.listUsers();
+      const roles = await guild.allRoles();
+      return Response.json({ members: users.map((u) => ({ ...u, role: roles[u.username] || 'member' })) });
+    }
+    if (url.pathname.startsWith('/api/members/') && method === 'PATCH') {
+      if (role !== 'owner') return forbidden();
+      const target = decodeURIComponent(url.pathname.slice('/api/members/'.length));
+      return done(await guild.setMemberRole(target, (await body()).role));
+    }
+
     return new Response('method not allowed', { status: 405 });
   },
 
@@ -388,6 +468,170 @@ export class Auth extends DurableObject {
     if (user.is_admin) return { ok: false, status: 400, error: '不能删除管理员账号' };
     this.sql.exec('DELETE FROM sessions WHERE username = ?', username);
     this.sql.exec('DELETE FROM users WHERE username = ?', username);
+    return { ok: true };
+  }
+}
+
+// ---------- 服务器(单例):分类 / 频道 / 成员角色(SQLite) ----------
+
+const CHANNEL_TYPES = ['voice', 'text'];
+const ASSIGNABLE_ROLES = ['admin', 'member'];
+
+export class Guild extends DurableObject {
+  constructor(ctx, env) {
+    super(ctx, env);
+    this.sql = ctx.storage.sql;
+    ctx.blockConcurrencyWhile(async () => {
+      this.sql.exec(`CREATE TABLE IF NOT EXISTS guild (
+        id INTEGER PRIMARY KEY CHECK (id = 1),
+        name TEXT NOT NULL,
+        icon TEXT NOT NULL DEFAULT '🎮',
+        description TEXT NOT NULL DEFAULT ''
+      )`);
+      this.sql.exec(`CREATE TABLE IF NOT EXISTS categories (
+        id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        position INTEGER NOT NULL DEFAULT 0
+      )`);
+      this.sql.exec(`CREATE TABLE IF NOT EXISTS channels (
+        id TEXT PRIMARY KEY,
+        category_id TEXT,
+        name TEXT NOT NULL,
+        type TEXT NOT NULL DEFAULT 'voice',
+        topic TEXT NOT NULL DEFAULT '',
+        position INTEGER NOT NULL DEFAULT 0
+      )`);
+      this.sql.exec(`CREATE TABLE IF NOT EXISTS members (
+        username TEXT PRIMARY KEY,
+        role TEXT NOT NULL DEFAULT 'member'
+      )`);
+      await this.seed();
+    });
+  }
+
+  // 首次启动播种:服务器信息 + 所有者(播种的管理员)+ 默认分类与频道
+  async seed() {
+    if (this.sql.exec('SELECT id FROM guild WHERE id = 1').toArray().length) return;
+    this.sql.exec(
+      'INSERT INTO guild (id, name, icon, description) VALUES (1, ?, ?, ?)',
+      this.env.GUILD_NAME || 'ScreenParty',
+      '🎮',
+      '一起开黑同屏',
+    );
+    if (this.env.ADMIN_USERNAME) {
+      this.sql.exec('INSERT OR IGNORE INTO members (username, role) VALUES (?, ?)', this.env.ADMIN_USERNAME, 'owner');
+    }
+    const cat = newId();
+    this.sql.exec('INSERT INTO categories (id, name, position) VALUES (?, ?, 0)', cat, '常规');
+    this.sql.exec('INSERT INTO channels (id, category_id, name, type, position) VALUES (?, ?, ?, ?, 0)', newId(), cat, '大厅', 'voice');
+    this.sql.exec('INSERT INTO channels (id, category_id, name, type, position) VALUES (?, ?, ?, ?, 1)', newId(), cat, '闲聊', 'text');
+  }
+
+  roleOf(username) {
+    const r = this.sql.exec('SELECT role FROM members WHERE username = ?', username).toArray()[0];
+    return r ? r.role : 'member';
+  }
+
+  allRoles() {
+    const map = {};
+    for (const r of this.sql.exec('SELECT username, role FROM members').toArray()) map[r.username] = r.role;
+    return map;
+  }
+
+  tree() {
+    const guild =
+      this.sql.exec('SELECT name, icon, description FROM guild WHERE id = 1').toArray()[0] ||
+      { name: 'ScreenParty', icon: '🎮', description: '' };
+    const categories = this.sql.exec('SELECT id, name, position FROM categories ORDER BY position, name').toArray();
+    const channels = this.sql
+      .exec('SELECT id, category_id AS categoryId, name, type, topic, position FROM channels ORDER BY position, name')
+      .toArray();
+    return { guild, categories, channels };
+  }
+
+  updateGuild({ name, icon, description } = {}) {
+    if (name !== undefined) {
+      const n = String(name).trim().slice(0, 32);
+      if (!n) return { ok: false, status: 400, error: '服务器名不能为空' };
+      this.sql.exec('UPDATE guild SET name = ? WHERE id = 1', n);
+    }
+    if (icon !== undefined) this.sql.exec('UPDATE guild SET icon = ? WHERE id = 1', String(icon).slice(0, 8));
+    if (description !== undefined) this.sql.exec('UPDATE guild SET description = ? WHERE id = 1', String(description).slice(0, 200));
+    return { ok: true };
+  }
+
+  createCategory({ name } = {}) {
+    const n = String(name || '').trim().slice(0, 24);
+    if (!n) return { ok: false, status: 400, error: '分类名不能为空' };
+    const id = newId();
+    const pos = this.sql.exec('SELECT COALESCE(MAX(position), -1) + 1 AS p FROM categories').toArray()[0]?.p || 0;
+    this.sql.exec('INSERT INTO categories (id, name, position) VALUES (?, ?, ?)', id, n, pos);
+    return { ok: true, id };
+  }
+
+  updateCategory(id, { name, position } = {}) {
+    if (!this.sql.exec('SELECT id FROM categories WHERE id = ?', id).toArray().length)
+      return { ok: false, status: 404, error: '分类不存在' };
+    if (name !== undefined) {
+      const n = String(name).trim().slice(0, 24);
+      if (!n) return { ok: false, status: 400, error: '分类名不能为空' };
+      this.sql.exec('UPDATE categories SET name = ? WHERE id = ?', n, id);
+    }
+    if (position !== undefined) this.sql.exec('UPDATE categories SET position = ? WHERE id = ?', Number(position) | 0, id);
+    return { ok: true };
+  }
+
+  deleteCategory(id) {
+    // 分类下的频道移到"未分类"(category_id = NULL),不删频道
+    this.sql.exec('UPDATE channels SET category_id = NULL WHERE category_id = ?', id);
+    this.sql.exec('DELETE FROM categories WHERE id = ?', id);
+    return { ok: true };
+  }
+
+  createChannel({ name, type, categoryId } = {}) {
+    const n = String(name || '').trim().slice(0, 24);
+    if (!n) return { ok: false, status: 400, error: '频道名不能为空' };
+    const t = CHANNEL_TYPES.includes(type) ? type : 'voice';
+    let cat = categoryId ? String(categoryId) : null;
+    if (cat && !this.sql.exec('SELECT id FROM categories WHERE id = ?', cat).toArray().length) cat = null;
+    const id = newId();
+    const pos = this.sql.exec('SELECT COALESCE(MAX(position), -1) + 1 AS p FROM channels').toArray()[0]?.p || 0;
+    this.sql.exec('INSERT INTO channels (id, category_id, name, type, position) VALUES (?, ?, ?, ?, ?)', id, cat, n, t, pos);
+    return { ok: true, id };
+  }
+
+  updateChannel(id, { name, topic, categoryId, position } = {}) {
+    if (!this.sql.exec('SELECT id FROM channels WHERE id = ?', id).toArray().length)
+      return { ok: false, status: 404, error: '频道不存在' };
+    if (name !== undefined) {
+      const n = String(name).trim().slice(0, 24);
+      if (!n) return { ok: false, status: 400, error: '频道名不能为空' };
+      this.sql.exec('UPDATE channels SET name = ? WHERE id = ?', n, id);
+    }
+    if (topic !== undefined) this.sql.exec('UPDATE channels SET topic = ? WHERE id = ?', String(topic).slice(0, 120), id);
+    if (categoryId !== undefined) {
+      let cat = categoryId ? String(categoryId) : null;
+      if (cat && !this.sql.exec('SELECT id FROM categories WHERE id = ?', cat).toArray().length) cat = null;
+      this.sql.exec('UPDATE channels SET category_id = ? WHERE id = ?', cat, id);
+    }
+    if (position !== undefined) this.sql.exec('UPDATE channels SET position = ? WHERE id = ?', Number(position) | 0, id);
+    return { ok: true };
+  }
+
+  deleteChannel(id) {
+    this.sql.exec('DELETE FROM channels WHERE id = ?', id);
+    return { ok: true };
+  }
+
+  setMemberRole(username, role) {
+    if (!ASSIGNABLE_ROLES.includes(role)) return { ok: false, status: 400, error: '角色只能是 admin 或 member' };
+    if (this.roleOf(username) === 'owner') return { ok: false, status: 400, error: '不能修改所有者的角色' };
+    this.sql.exec(
+      'INSERT INTO members (username, role) VALUES (?, ?) ON CONFLICT(username) DO UPDATE SET role = ?',
+      username,
+      role,
+      role,
+    );
     return { ok: true };
   }
 }
