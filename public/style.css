@@ -169,35 +169,32 @@ button:focus-visible, input:focus-visible { outline: 2px solid var(--amber); out
 .op-btn { margin-left: 0; font-size: 11px; padding: 4px 9px; }
 .op-danger:hover { color: var(--tally); border-color: var(--tally); }
 
-/* ---------- 三栏应用布局 ---------- */
+/* ---------- 两栏应用布局 ---------- */
 
 .app {
   height: 100dvh;
   display: grid;
-  grid-template-columns: 248px 224px 1fr;
+  grid-template-columns: 260px 1fr;
   overflow: hidden;
 }
 
-/* 第一栏:服务器图标 + 底部用户面板 */
-.server-rail {
-  background: #0f1216;
-  border-right: 1px solid var(--line);
-  display: flex;
-  flex-direction: column;
-  padding: 12px;
-  gap: 10px;
-}
+/* 服务器徽标(位于频道栏头部) */
 .server-badge {
-  width: 48px; height: 48px;
-  border-radius: 14px;
+  width: 28px; height: 28px; flex: 0 0 28px;
+  border-radius: 8px;
   background: var(--panel-2);
   display: flex; align-items: center; justify-content: center;
-  font-size: 24px;
+  font-size: 15px;
   border: 1px solid var(--line);
   cursor: default;
 }
-.rail-fill { flex: 1; }
 
+/* 底部用户面板 */
+.channels-foot {
+  padding: 8px;
+  border-top: 1px solid var(--line);
+  background: #0f1216;
+}
 .userbar {
   position: relative;
   background: var(--panel);
@@ -254,7 +251,7 @@ button:focus-visible, input:focus-visible { outline: 2px solid var(--amber); out
 }
 .menu-item:hover { background: var(--tally); color: #fff; }
 
-/* 第二栏:频道列表 */
+/* 第一栏:服务器头 + 频道列表 + 用户面板 */
 .channels {
   background: var(--panel);
   border-right: 1px solid var(--line);
@@ -263,7 +260,7 @@ button:focus-visible, input:focus-visible { outline: 2px solid var(--amber); out
   min-height: 0;
 }
 .guild-head {
-  padding: 14px 16px;
+  padding: 10px 12px;
   border-bottom: 1px solid var(--line);
   font-weight: 600;
   letter-spacing: 0.3px;
@@ -377,8 +374,7 @@ button:focus-visible, input:focus-visible { outline: 2px solid var(--amber); out
 .tile-stats:empty { display: none; }
 
 @media (max-width: 860px) {
-  .app { grid-template-columns: 72px 200px 1fr; }
-  .userbar { flex-direction: column; align-items: stretch; }
+  .app { grid-template-columns: 200px 1fr; }
   .userbar-text { display: none; }
 }
 @media (max-width: 640px) {

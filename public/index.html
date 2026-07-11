@@ -11,43 +11,40 @@
 <!-- 未登录会被 app.js 跳转到 /login.html -->
 <div id="app" class="app" hidden>
 
-  <!-- 第一栏:服务器图标 + 底部用户面板 -->
-  <nav class="server-rail">
-    <div class="server-badge" id="serverBadge" title="服务器">🎮</div>
-    <div class="rail-fill"></div>
-    <div class="userbar">
-      <div class="userbar-id">
-        <span class="avatar" id="uAvatar"></span>
-        <span class="userbar-text">
-          <span class="userbar-nick" id="uNick"></span>
-          <span class="userbar-role" id="uRole"></span>
-        </span>
-      </div>
-      <div class="userbar-actions">
-        <button id="micToggle" class="icon-btn" aria-pressed="true" title="麦克风">
-          <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path fill="currentColor" d="M12 14a3 3 0 0 0 3-3V6a3 3 0 1 0-6 0v5a3 3 0 0 0 3 3Zm5-3a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.92V21h2v-3.08A7 7 0 0 0 19 11h-2Z"/></svg>
-        </button>
-        <button id="settingsBtn" class="icon-btn" title="设置" aria-haspopup="true" aria-expanded="false">
-          <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path fill="currentColor" d="M12 8a4 4 0 1 0 0 8 4 4 0 0 0 0-8Zm8.94 4a7.5 7.5 0 0 0-.1-1.2l2-1.56-2-3.46-2.36.95a7.4 7.4 0 0 0-2.08-1.2L15.9 2h-4l-.4 2.53a7.4 7.4 0 0 0-2.08 1.2L7.06 4.8l-2 3.46 2 1.56a7.6 7.6 0 0 0 0 2.4l-2 1.56 2 3.46 2.36-.95c.62.5 1.32.9 2.08 1.2L12 22h4l.4-2.53a7.4 7.4 0 0 0 2.08-1.2l2.36.95 2-3.46-2-1.56c.06-.4.1-.8.1-1.2Z"/></svg>
-        </button>
-      </div>
-      <div id="userMenu" class="user-menu" hidden>
-        <a id="adminLink" class="menu-item" href="/admin.html" hidden>用户管理</a>
-        <button id="logoutBtn" class="menu-item">退出登录</button>
-      </div>
-    </div>
-  </nav>
-
-  <!-- 第二栏:频道列表 -->
+  <!-- 第一栏:服务器头 + 频道列表 + 底部用户面板 -->
   <section class="channels">
     <header class="guild-head">
+      <div class="server-badge" id="serverBadge" title="服务器">🎮</div>
       <span class="guild-name" id="guildName">ScreenParty</span>
       <button id="guildMenuBtn" class="guild-menu-btn" title="服务器管理" hidden>⌄</button>
     </header>
     <div class="channel-scroll" id="channelList"></div>
+    <footer class="channels-foot">
+      <div class="userbar">
+        <div class="userbar-id">
+          <span class="avatar" id="uAvatar"></span>
+          <span class="userbar-text">
+            <span class="userbar-nick" id="uNick"></span>
+            <span class="userbar-role" id="uRole"></span>
+          </span>
+        </div>
+        <div class="userbar-actions">
+          <button id="micToggle" class="icon-btn" aria-pressed="true" title="麦克风">
+            <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path fill="currentColor" d="M12 14a3 3 0 0 0 3-3V6a3 3 0 1 0-6 0v5a3 3 0 0 0 3 3Zm5-3a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.92V21h2v-3.08A7 7 0 0 0 19 11h-2Z"/></svg>
+          </button>
+          <button id="settingsBtn" class="icon-btn" title="设置" aria-haspopup="true" aria-expanded="false">
+            <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path fill="currentColor" d="M12 8a4 4 0 1 0 0 8 4 4 0 0 0 0-8Zm8.94 4a7.5 7.5 0 0 0-.1-1.2l2-1.56-2-3.46-2.36.95a7.4 7.4 0 0 0-2.08-1.2L15.9 2h-4l-.4 2.53a7.4 7.4 0 0 0-2.08 1.2L7.06 4.8l-2 3.46 2 1.56a7.6 7.6 0 0 0 0 2.4l-2 1.56 2 3.46 2.36-.95c.62.5 1.32.9 2.08 1.2L12 22h4l.4-2.53a7.4 7.4 0 0 0 2.08-1.2l2.36.95 2-3.46-2-1.56c.06-.4.1-.8.1-1.2Z"/></svg>
+          </button>
+        </div>
+        <div id="userMenu" class="user-menu" hidden>
+          <a id="adminLink" class="menu-item" href="/admin.html" hidden>用户管理</a>
+          <button id="logoutBtn" class="menu-item">退出登录</button>
+        </div>
+      </div>
+    </footer>
   </section>
 
-  <!-- 第三栏:主区 -->
+  <!-- 第二栏:主区 -->
   <main class="stage-col">
     <header class="topbar" id="channelBar" hidden>
       <span class="ch-ico" aria-hidden="true">🔊</span>
