@@ -33,7 +33,7 @@ wrangler secret put ADMIN_NICKNAME   # 可选,显示的名字,缺省用用户名
 wrangler deploy                       # 重新部署使其生效
 ```
 
-- **本地开发**:复制 `.dev.vars.example` 为 `.dev.vars`(已被 `.gitignore` 忽略,不会提交)填好,再 `npm run dev`。可选 `GUILD_NAME` 设置服务器显示名。
+- **本地开发**(可选,与上面互不影响):`wrangler secret put` 只作用于线上部署;本地 `npm run dev` 读不到线上 secret,需另外复制 `.dev.vars.example` 为 `.dev.vars`(已被 `.gitignore` 忽略,不会提交)填好同名变量。只部署不本地开发的话跳过这条。可选 `GUILD_NAME` 设置服务器显示名。
 - **角色与权限**:`ADMIN_USERNAME` 是服务器**所有者**(唯一,可任命管理员);**管理员**能建/改/删频道分类、改服务器信息;**成员**只能进频道开黑。角色在网页左下用户面板 → 设置,或服务器名旁的 ⌄ 菜单 →「成员与角色」里管理(仅所有者可改)。
 - **频道管理**:所有者/管理员在频道名上 hover 出现 `⋯`,或用服务器 ⌄ 菜单新建频道/分类、编辑、删除。
 - **管理其他账号**:用管理员登录后,左下用户面板 → 设置齿轮 →「用户管理」进入 `/admin.html`,可**新增 / 改昵称 / 重置密码 / 启用停用 / 删除**普通用户。进房间的昵称由管理员设定、用户不可改。
@@ -127,6 +127,7 @@ sudo party status     # 应显示「● coturn 运行中」、监听 3478
 ```
 
 > jsDelivr 对 `@main` 有缓存(更新脚本后可能延迟几小时);想立刻拿最新版,把 `@main` 换成对应的 commit 短哈希即可。
+
 | 命令 | 作用 |
 |------|------|
 | `party` | **交互菜单**:输数字选操作(状态/启停/重启/日志/自启/配置),像宝塔那样 |
@@ -136,23 +137,15 @@ sudo party status     # 应显示「● coturn 运行中」、监听 3478
 | `party log` | 实时日志(排查问题) |
 | `party conf` | 查看配置文件 |
 
-**第 6 步 · 接进 Worker**(在本仓库目录执行)
+**第 6 步 · 接进 Worker**(在你本地电脑的本仓库目录执行,不是在 VPS 上)
 ```bash
 wrangler secret put COTURN_SECRET     # 粘贴第 2 步输出的 SECRET
-```
-在 `wrangler.jsonc` 里加(不敏感,用 `vars` 即可):
-```jsonc
-"vars": {
-  "COTURN_HOST": "第2步的公网IP,或你的域名"   // 不带端口
-  // 配了 TLS(下方进阶)再加:"COTURN_TLS_HOST": "turn.你的域名"
-}
-```
-```bash
-wrangler deploy
+wrangler secret put COTURN_HOST       # 第 2 步的公网 IP 或你的域名,不带端口
+wrangler deploy                        # 重新部署使其生效
 ```
 
 **第 7 步 · 验证**
-- 打开 `https://party.juryory.com/api/turn`,看到 `turn:...` 且带 `username`/`credential` → 接入成功
+- 打开 `https://你的部署地址/api/turn`,看到 `turn:...` 且带 `username`/`credential` → 接入成功
 - 想确认真能中继:用 [Trickle ICE 测试页](https://webrtc.github.io/samples/src/content/peerconnection/trickle-ice/) 填 `turn:你的公网IP:3478?transport=udp` + 上面的 `username`/`credential`,点 **Gather candidates**,出现 `relay` 类型候选 = 中继链路已通
 
 **(进阶 · 可选)开启 TLS —— 让 `turns://` 穿透只放行 443/加密流量的严格网络**
@@ -166,7 +159,7 @@ wrangler deploy
    cert=/www/server/panel/vhost/cert/turn.你的域名/fullchain.pem
    pkey=/www/server/panel/vhost/cert/turn.你的域名/privkey.pem
    ```
-3. `sudo party restart`;并在 `wrangler.jsonc` 的 `vars` 加 `"COTURN_TLS_HOST": "turn.你的域名"`,再 `wrangler deploy`
+3. `sudo party restart`;然后在本地仓库目录执行 `wrangler secret put COTURN_TLS_HOST`(填 `turn.你的域名`),再 `wrangler deploy`
 
 > **带宽**:每路屏幕 ~3.5 Mbps,一对中转连接在服务器上约占 **3.5 Mbps 入 + 3.5 Mbps 出**。
 > 200M 峰值带宽可轻松扛住十几路中转;而且 TURN 只对**少数打洞失败的成员对**生效,绝大多数人仍是 P2P 直连,不经过这台机器。
