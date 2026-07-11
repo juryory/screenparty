@@ -31,6 +31,32 @@ const SCREEN_MAX_BITRATE = 3_500_000; // ~3.5 Mbps,主窗口(被人放大观看)
 const THUMB_MAX_BITRATE = 300_000;    // 缩略图(没在主窗口看的共享)只发 ~300kbps
 const THUMB_SCALE = 3;                // 且分辨率降到 1/3,低码率下更耐看
 
+// ---------- Safari 自动播放兜底 ----------
+// Safari 拦截带声 autoplay(play() 拒绝后连画面都不解码,表现为黑屏)。
+// 兜底:被拒就先静音播出画面,等用户下一次点击页面(Safari 认的手势)统一解除静音重播。
+const pendingUnmute = new Set();
+
+function safePlay(el) {
+  el.play().catch(() => {
+    if (el.muted) return;
+    el.muted = true;
+    pendingUnmute.add(el);
+    el.play().catch(() => {});
+  });
+}
+
+document.addEventListener(
+  'pointerdown',
+  () => {
+    for (const el of pendingUnmute) {
+      el.muted = false;
+      el.play().catch(() => {});
+    }
+    pendingUnmute.clear();
+  },
+  true
+);
+
 // ---------- 启动 / 鉴权 ----------
 
 bootstrapAuth();
@@ -313,10 +339,21 @@ function createPeerConnection(peerId) {
       peer.audioEl = peer.audioEl || new Audio();
       peer.audioEl.autoplay = true;
       peer.audioEl.srcObject = new MediaStream([e.track]);
+      safePlay(peer.audioEl);
     } else {
       // 对方屏幕(视频 + 游戏声),合入同一条流保证音画同步
       peer.videoStream.addTrack(e.track);
+      const oldTile = peer.tile;
       refreshTiles();
+      // WebKit:流挂上 <video> 后再 addTrack 可能不刷新画面;复用旧瓦片时重设 srcObject 兜底
+      // (新建的瓦片 makeTile 里已挂流并 safePlay,无需重复)
+      if (peer.tile && peer.tile === oldTile) {
+        const v = peer.tile.querySelector('video');
+        if (v) {
+          v.srcObject = peer.videoStream;
+          safePlay(v);
+        }
+      }
     }
   };
 
@@ -651,6 +688,7 @@ function makeTile(name, stream, muted, key) {
   const video = tile.querySelector('video');
   video.srcObject = stream;
   video.muted = muted; // 本地预览静音,防回声
+  safePlay(video);
   tile.querySelector('.umd-name').textContent = name;
   tile.classList.add('on-air');
   tile.dataset.key = key;
