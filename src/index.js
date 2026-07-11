@@ -175,6 +175,11 @@ export default {
       const user = await auth.verify(getCookie(request, SESSION_COOKIE));
       if (!user) return new Response('unauthorized', { status: 401 });
 
+      // 频道密码校验(owner/admin 免密):不通过直接拒绝升级,改前端也绕不过
+      const guildDO = env.GUILD.get(env.GUILD.idFromName('global'));
+      const allowed = await guildDO.canEnter(wsMatch[1], user.username, url.searchParams.get('pw') || '');
+      if (!allowed) return new Response('channel password required', { status: 403 });
+
       const headers = new Headers(request.headers);
       headers.set('X-SP-Nick', encodeURIComponent(user.nickname)); // 覆盖任何客户端伪造值
       headers.set('X-SP-User', user.username);
@@ -278,6 +283,14 @@ export default {
       const id = decodeURIComponent(url.pathname.slice('/api/categories/'.length));
       if (method === 'PATCH') return done(await guild.updateCategory(id, await body()));
       if (method === 'DELETE') return done(await guild.deleteCategory(id));
+    }
+
+    // 频道密码预校验(普通用户进带锁频道前调用,拿到明确的对错提示)
+    const verifyMatch = url.pathname.match(/^\/api\/channels\/([^/]+)\/verify$/);
+    if (verifyMatch && method === 'POST') {
+      const chId = decodeURIComponent(verifyMatch[1]);
+      const ok = await guild.canEnter(chId, user.username, String((await body()).password || ''));
+      return ok ? Response.json({ ok: true }) : Response.json({ error: '频道密码错误' }, { status: 403 });
     }
 
     // 频道
@@ -546,8 +559,13 @@ export class Guild extends DurableObject {
         name TEXT NOT NULL,
         type TEXT NOT NULL DEFAULT 'voice',
         topic TEXT NOT NULL DEFAULT '',
+        password TEXT NOT NULL DEFAULT '',
         position INTEGER NOT NULL DEFAULT 0
       )`);
+      // 迁移:旧库补频道密码列(新库建表已含,ALTER 抛错跳过)
+      try {
+        this.sql.exec("ALTER TABLE channels ADD COLUMN password TEXT NOT NULL DEFAULT ''");
+      } catch {}
       this.sql.exec(`CREATE TABLE IF NOT EXISTS members (
         username TEXT PRIMARY KEY,
         role TEXT NOT NULL DEFAULT 'member'
@@ -591,9 +609,21 @@ export class Guild extends DurableObject {
       { name: 'ScreenParty', icon: '🎮', description: '' };
     const categories = this.sql.exec('SELECT id, name, position FROM categories ORDER BY position, name').toArray();
     const channels = this.sql
-      .exec('SELECT id, category_id AS categoryId, name, type, topic, position FROM channels ORDER BY position, name')
-      .toArray();
+      .exec('SELECT id, category_id AS categoryId, name, type, topic, password, position FROM channels ORDER BY position, name')
+      .toArray()
+      // 只暴露"有没有密码",绝不下发密码本身
+      .map(({ password, ...ch }) => ({ ...ch, hasPassword: !!password }));
     return { guild, categories, channels };
+  }
+
+  // 进入频道校验:无密码放行;owner/admin 免密;其余比对密码。
+  // 未登记的房间名放行(保持旧行为,反正那是另一个房间,不构成绕过)。
+  canEnter(channelId, username, pw) {
+    const ch = this.sql.exec('SELECT password FROM channels WHERE id = ?', channelId).toArray()[0];
+    if (!ch || !ch.password) return true;
+    const role = this.roleOf(username);
+    if (role === 'owner' || role === 'admin') return true;
+    return String(pw) === ch.password;
   }
 
   updateGuild({ name, icon, description } = {}) {
@@ -635,7 +665,7 @@ export class Guild extends DurableObject {
     return { ok: true };
   }
 
-  createChannel({ name, type, categoryId } = {}) {
+  createChannel({ name, type, categoryId, password } = {}) {
     const n = String(name || '').trim().slice(0, 24);
     if (!n) return { ok: false, status: 400, error: '频道名不能为空' };
     const t = CHANNEL_TYPES.includes(type) ? type : 'voice';
@@ -643,11 +673,14 @@ export class Guild extends DurableObject {
     if (cat && !this.sql.exec('SELECT id FROM categories WHERE id = ?', cat).toArray().length) cat = null;
     const id = newId();
     const pos = this.sql.exec('SELECT COALESCE(MAX(position), -1) + 1 AS p FROM channels').toArray()[0]?.p || 0;
-    this.sql.exec('INSERT INTO channels (id, category_id, name, type, position) VALUES (?, ?, ?, ?, ?)', id, cat, n, t, pos);
+    this.sql.exec(
+      'INSERT INTO channels (id, category_id, name, type, password, position) VALUES (?, ?, ?, ?, ?, ?)',
+      id, cat, n, t, String(password || '').slice(0, 64), pos,
+    );
     return { ok: true, id };
   }
 
-  updateChannel(id, { name, topic, categoryId, position } = {}) {
+  updateChannel(id, { name, topic, categoryId, position, password } = {}) {
     if (!this.sql.exec('SELECT id FROM channels WHERE id = ?', id).toArray().length)
       return { ok: false, status: 404, error: '频道不存在' };
     if (name !== undefined) {
@@ -656,6 +689,8 @@ export class Guild extends DurableObject {
       this.sql.exec('UPDATE channels SET name = ? WHERE id = ?', n, id);
     }
     if (topic !== undefined) this.sql.exec('UPDATE channels SET topic = ? WHERE id = ?', String(topic).slice(0, 120), id);
+    // 空字符串 = 清除密码
+    if (password !== undefined) this.sql.exec('UPDATE channels SET password = ? WHERE id = ?', String(password).slice(0, 64), id);
     if (categoryId !== undefined) {
       let cat = categoryId ? String(categoryId) : null;
       if (cat && !this.sql.exec('SELECT id FROM categories WHERE id = ?', cat).toArray().length) cat = null;

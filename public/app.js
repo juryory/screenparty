@@ -24,6 +24,7 @@ const state = {
   screenStream: null,
   camStream: null,
   presence: {}, // channelId -> 当前人数(轮询 /api/presence)
+  channelPw: {}, // channelId -> 本次会话里验证过的频道密码(内存缓存,重进免输)
   peers: new Map(), // id -> { name, sharing, camera, pc, senders, tile, camTile, videoStream, camStream, audioEl, sendQuality, viewReq }
   focusedId: null,  // 当前主舞台显示谁:peer id / id+':cam' / 'local' / 'local:cam' / null
 };
@@ -185,11 +186,12 @@ function channelItem(ch) {
   row.className = 'channel-row';
   row.dataset.channel = ch.id;
   row.classList.toggle('is-active', ch.id === state.channelId);
-  row.innerHTML = `<span class="ch-glyph">${ch.type === 'text' ? '#' : '🔊'}</span><span class="ch-label"><span class="ch-name-txt"></span><span class="ch-count"></span></span>`;
+  row.innerHTML = `<span class="ch-glyph">${ch.type === 'text' ? '#' : '🔊'}</span><span class="ch-label"><span class="ch-name-txt"></span><span class="ch-lock" title="需要密码">🔒</span><span class="ch-count"></span></span>`;
   row.querySelector('.ch-name-txt').textContent = ch.name;
+  row.querySelector('.ch-lock').hidden = !ch.hasPassword;
   const n = channelCount(ch.id);
   row.querySelector('.ch-count').textContent = n ? ` (${n})` : '';
-  if (ch.type !== 'text') row.addEventListener('click', () => joinChannel(ch.id, ch.name, ch.topic));
+  if (ch.type !== 'text') row.addEventListener('click', () => tryJoinChannel(ch));
   if (canManage()) addChannelActions(row, ch);
   wrap.appendChild(row);
   if (ch.id === state.channelId) {
@@ -202,6 +204,24 @@ function channelItem(ch) {
 }
 
 // ---------- 进入 / 离开频道 ----------
+
+// 带锁频道:普通成员先验密码(owner/admin 免密,服务端同样放行)
+function tryJoinChannel(ch) {
+  if (!ch.hasPassword || canManage() || state.channelPw[ch.id]) {
+    return joinChannel(ch.id, ch.name, ch.topic);
+  }
+  const input = textInput('', '频道密码', 64);
+  input.type = 'password';
+  const body = document.createElement('div');
+  body.append(field(`「${ch.name}」需要密码`, input));
+  openModal('输入频道密码', body, async () => {
+    const pw = input.value;
+    const r = await api('POST', `/api/channels/${ch.id}/verify`, { password: pw });
+    if (!r.ok) return (alert(r.error || '密码错误'), false);
+    state.channelPw[ch.id] = pw;
+    joinChannel(ch.id, ch.name, ch.topic);
+  }, '进入');
+}
 
 async function joinChannel(id, name, topic) {
   if (state.channelId === id) return;
@@ -371,7 +391,10 @@ async function acquireMic() {
 
 function connectSignaling() {
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-  const ws = new WebSocket(`${proto}://${location.host}/ws/${encodeURIComponent(state.channelId)}`);
+  const pw = state.channelPw[state.channelId];
+  const ws = new WebSocket(
+    `${proto}://${location.host}/ws/${encodeURIComponent(state.channelId)}${pw ? `?pw=${encodeURIComponent(pw)}` : ''}`,
+  );
   state.ws = ws;
 
   ws.onopen = () => ws.send(JSON.stringify({ type: 'join', name: state.myName }));
@@ -416,7 +439,13 @@ function connectSignaling() {
     if (state.ws !== ws) return;
     // 同账号在别处进了频道,本连接被服务器顶掉:退出本地频道状态
     // (其他断线不动:媒体是 P2P 的,信令断开不影响通话,由自愈逻辑处理)
-    if (e.reason === 'replaced') leaveChannel();
+    if (e.reason === 'replaced') return leaveChannel();
+    // 从未收到 welcome 就被关 = 连接被拒(如密码已被管理员改掉):清缓存退出
+    if (!state.myId && state.channelId) {
+      delete state.channelPw[state.channelId];
+      leaveChannel();
+      alert('进入频道失败,密码可能已更改,请重试');
+    }
   };
 }
 
@@ -439,6 +468,22 @@ function createPeerConnection(peerId) {
 
   pc.ontrack = (e) => {
     const idx = pc.getTransceivers().indexOf(e.transceiver);
+
+    // Safari 黑屏修复:对方停止共享→重新共享走的是 replaceTrack,接收端不会再有
+    // ontrack,只是同一条 track 先 muted 再 unmuted。WebKit 对「挂载时还是 muted、
+    // 之后才恢复」的轨道不会自动开始渲染,必须在 unmute(数据恢复)时重挂流强制刷新。
+    if (idx === 1 || idx === 3) {
+      e.track.onunmute = () => {
+        refreshTiles(); // 信令若晚到,先按当前状态补瓦片
+        const tile = idx === 3 ? peer.camTile : peer.tile;
+        const v = tile?.querySelector('video');
+        if (v) {
+          v.srcObject = idx === 3 ? peer.camStream : peer.videoStream;
+          safePlay(v);
+        }
+      };
+    }
+
     if (idx === 0) {
       // 对方麦克风
       peer.audioEl = peer.audioEl || new Audio();
@@ -1194,11 +1239,14 @@ function openServerSettings() {
 function openCreateChannel(categoryId) {
   const name = textInput('', '频道名', 24);
   const cat = categorySelect(categoryId || '');
+  const pw = textInput('', '留空则无密码', 64);
   const body = document.createElement('div');
-  body.append(field('频道名', name), field('所属分类', cat));
+  body.append(field('频道名', name), field('所属分类', cat), field('频道密码(可选)', pw));
   openModal('新建语音频道', body, async () => {
     if (!name.value.trim()) return false;
-    const r = await api('POST', '/api/channels', { name: name.value.trim(), type: 'voice', categoryId: cat.value || null });
+    const r = await api('POST', '/api/channels', {
+      name: name.value.trim(), type: 'voice', categoryId: cat.value || null, password: pw.value.trim(),
+    });
     if (!r.ok) return (alert(r.error || '创建失败'), false);
     await loadGuild();
   }, '创建');
@@ -1208,11 +1256,26 @@ function openEditChannel(ch) {
   const name = textInput(ch.name, '频道名', 24);
   const topic = textInput(ch.topic || '', '频道简介(可选)', 120);
   const cat = categorySelect(ch.categoryId || '');
+  const pw = textInput('', ch.hasPassword ? '已设置,留空不修改' : '留空则无密码', 64);
   const body = document.createElement('div');
-  body.append(field('频道名', name), field('简介', topic), field('所属分类', cat));
+  body.append(field('频道名', name), field('简介', topic), field('所属分类', cat), field('频道密码', pw));
+  let clearPw = null;
+  if (ch.hasPassword) {
+    const wrap = document.createElement('label');
+    wrap.className = 'field field-check';
+    clearPw = document.createElement('input');
+    clearPw.type = 'checkbox';
+    const txt = document.createElement('span');
+    txt.textContent = ' 清除密码(改回公开频道)';
+    wrap.append(clearPw, txt);
+    body.appendChild(wrap);
+  }
   openModal('编辑频道', body, async () => {
     if (!name.value.trim()) return false;
-    const r = await api('PATCH', '/api/channels/' + ch.id, { name: name.value.trim(), topic: topic.value.trim(), categoryId: cat.value || null });
+    const patch = { name: name.value.trim(), topic: topic.value.trim(), categoryId: cat.value || null };
+    if (clearPw?.checked) patch.password = '';
+    else if (pw.value.trim()) patch.password = pw.value.trim();
+    const r = await api('PATCH', '/api/channels/' + ch.id, patch);
     if (!r.ok) return (alert(r.error || '保存失败'), false);
     if (state.channelId === ch.id) $('curChannel').textContent = name.value.trim();
     await loadGuild();
