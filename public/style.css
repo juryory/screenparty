@@ -177,6 +177,9 @@ button:focus-visible, input:focus-visible { outline: 2px solid var(--amber); out
   height: 100dvh;
   display: grid;
   grid-template-columns: 260px 1fr;
+  /* 行高钉死在容器高度:否则行随内容(如新出现的视频瓦片)长高,
+     整行超出 100dvh,底部用户面板和画面一起被顶出屏幕 */
+  grid-template-rows: minmax(0, 1fr);
   overflow: hidden;
 }
 
@@ -329,8 +332,8 @@ button:focus-visible, input:focus-visible { outline: 2px solid var(--amber); out
 /* 本地摄像头预览镜像(只镜像自己,别人看到的是正的) */
 .tile.is-cam-local video { transform: scaleX(-1); }
 
-/* 第三栏:主区 */
-.stage-col { min-width: 0; display: flex; flex-direction: column; background: var(--bg); }
+/* 第二栏:主区 */
+.stage-col { min-width: 0; min-height: 0; display: flex; flex-direction: column; background: var(--bg); }
 .topbar {
   display: flex; align-items: center; gap: 10px;
   padding: 10px 14px;
@@ -371,7 +374,7 @@ button:focus-visible, input:focus-visible { outline: 2px solid var(--amber); out
 
 /* ---------- 主舞台 + 胶片栏(演讲者视图) ---------- */
 .stage-wrap { flex: 1; min-height: 0; display: flex; gap: 8px; padding: 8px; }
-.stage { flex: 1; min-width: 0; display: flex; align-items: center; justify-content: center; position: relative; }
+.stage { flex: 1; min-width: 0; min-height: 0; display: flex; align-items: center; justify-content: center; position: relative; }
 #rail {
   flex: 0 0 208px;
   overflow-y: auto;
