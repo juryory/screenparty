@@ -13,7 +13,11 @@ const state = {
   ws: null,
   myId: null,
   myName: '',
-  room: '',
+  myUser: '',
+  role: 'member',
+  channelId: null,
+  channelName: '',
+  guild: null, // { guild:{name,icon,description}, categories:[], channels:[], me:{role} }
   iceServers: [{ urls: 'stun:stun.cloudflare.com:3478' }],
   micTrack: null,
   screenStream: null,
@@ -21,16 +25,14 @@ const state = {
   focusedId: null,  // 当前主舞台显示谁:peer id / 'local' / null
 };
 
+const ROLE_LABEL = { owner: '所有者', admin: '管理员', member: '成员' };
+
 const SCREEN_MAX_BITRATE = 3_500_000; // ~3.5 Mbps,主窗口(被人放大观看)的全码率
 const THUMB_MAX_BITRATE = 300_000;    // 缩略图(没在主窗口看的共享)只发 ~300kbps
 const THUMB_SCALE = 3;                // 且分辨率降到 1/3,低码率下更耐看
 
-// ---------- 鉴权 / 登录 ----------
+// ---------- 启动 / 鉴权 ----------
 
-const params = new URLSearchParams(location.search);
-if (params.get('room')) $('roomInput').value = params.get('room');
-
-// 启动:查当前身份 —— 未登录跳转到独立的登录页,登录后才回到本页(大厅)
 bootstrapAuth();
 
 async function bootstrapAuth() {
@@ -39,20 +41,43 @@ async function bootstrapAuth() {
     const r = await fetch('/api/me');
     if (r.ok) me = (await r.json()).user;
   } catch {}
-  if (me) showLobby(me);
-  else {
-    const room = params.get('room');
-    location.replace(room ? `/login.html?room=${encodeURIComponent(room)}` : '/login.html');
-  }
-}
-
-function showLobby(me) {
+  if (!me) return location.replace('/login.html');
   state.myName = me.nickname;
-  $('lobby').hidden = false;
-  $('lobbyNick').textContent = me.nickname;
+  state.myUser = me.username;
+  $('app').hidden = false;
+  $('uNick').textContent = me.nickname;
+  $('uAvatar').textContent = me.nickname.slice(0, 2);
   $('adminLink').hidden = !me.isAdmin;
+  await loadGuild();
+  startStatsLoop();
 }
 
+// 拉服务器结构(名称/图标/分类/频道/我的角色)并渲染频道列表
+async function loadGuild() {
+  try {
+    const r = await fetch('/api/guild');
+    if (!r.ok) return;
+    state.guild = await r.json();
+  } catch {
+    return;
+  }
+  state.role = state.guild.me?.role || 'member';
+  $('guildName').textContent = state.guild.guild.name;
+  $('serverBadge').textContent = state.guild.guild.icon || '🎮';
+  $('serverBadge').title = state.guild.guild.name;
+  $('uRole').textContent = ROLE_LABEL[state.role] || '成员';
+  renderChannels();
+}
+
+// 设置菜单(退出登录 / 用户管理)
+$('settingsBtn').addEventListener('click', () => {
+  const m = $('userMenu');
+  m.hidden = !m.hidden;
+  $('settingsBtn').setAttribute('aria-expanded', String(!m.hidden));
+});
+document.addEventListener('click', (e) => {
+  if (!e.target.closest('.userbar')) $('userMenu').hidden = true;
+});
 $('logoutBtn').addEventListener('click', async () => {
   try {
     await fetch('/api/logout', { method: 'POST' });
@@ -60,35 +85,134 @@ $('logoutBtn').addEventListener('click', async () => {
   location.replace('/login.html');
 });
 
-// ---------- 加入流程 ----------
+// ---------- 频道列表 ----------
 
-$('joinBtn').addEventListener('click', join);
-$('roomInput').addEventListener('keydown', (e) => e.key === 'Enter' && join());
-
-async function join() {
-  const room = $('roomInput').value.trim();
-  if (!state.myName) return showLobbyError('登录状态已失效,请重新登录');
-  if (!room) return showLobbyError('请填写房间名');
-  if (!/^[\w\u4e00-\u9fff-]{1,32}$/.test(room))
-    return showLobbyError('房间名只能包含中英文、数字、下划线和连字符');
-
-  $('joinBtn').disabled = true;
-  showLobbyError('');
-
-  // 没有麦克风时不阻塞进房:只共享/观看画面、收听别人语音
-  state.micTrack = await acquireMic();
-
-  try {
-    const r = await fetch('/api/turn');
-    if (r.ok) {
-      const j = await r.json();
-      if (Array.isArray(j.iceServers) && j.iceServers.length) state.iceServers = j.iceServers;
+function renderChannels() {
+  const list = $('channelList');
+  list.innerHTML = '';
+  const { categories, channels } = state.guild;
+  const byCat = new Map();
+  const uncategorized = [];
+  for (const ch of channels) {
+    if (ch.categoryId && categories.some((c) => c.id === ch.categoryId)) {
+      if (!byCat.has(ch.categoryId)) byCat.set(ch.categoryId, []);
+      byCat.get(ch.categoryId).push(ch);
+    } else {
+      uncategorized.push(ch);
     }
-  } catch {}
+  }
+  for (const ch of uncategorized) list.appendChild(channelItem(ch));
+  for (const cat of categories) {
+    const head = document.createElement('div');
+    head.className = 'cat-head';
+    head.textContent = cat.name;
+    list.appendChild(head);
+    for (const ch of byCat.get(cat.id) || []) list.appendChild(channelItem(ch));
+  }
+}
 
-  state.room = room; // state.myName 已在登录后锁定为账号昵称
+function channelItem(ch) {
+  const wrap = document.createElement('div');
+  wrap.className = 'channel-item';
+  const row = document.createElement('div');
+  row.className = 'channel-row';
+  row.dataset.channel = ch.id;
+  row.classList.toggle('is-active', ch.id === state.channelId);
+  row.innerHTML = `<span class="ch-glyph">${ch.type === 'text' ? '#' : '🔊'}</span><span class="ch-label"></span>`;
+  row.querySelector('.ch-label').textContent = ch.name;
+  if (ch.type !== 'text') row.addEventListener('click', () => joinChannel(ch.id, ch.name, ch.topic));
+  wrap.appendChild(row);
+  if (ch.id === state.channelId) {
+    const mem = document.createElement('div');
+    mem.className = 'channel-members';
+    mem.id = 'channelMembers';
+    wrap.appendChild(mem);
+  }
+  return wrap;
+}
+
+// ---------- 进入 / 离开频道 ----------
+
+async function joinChannel(id, name, topic) {
+  if (state.channelId === id) return;
+  if (state.channelId) leaveChannel(false);
+
+  // 没有麦克风时不阻塞:只共享/观看画面、收听别人语音
+  if (!state.micTrack) state.micTrack = await acquireMic();
+  if (state.iceServers.length <= 1) {
+    try {
+      const r = await fetch('/api/turn');
+      if (r.ok) {
+        const j = await r.json();
+        if (Array.isArray(j.iceServers) && j.iceServers.length) state.iceServers = j.iceServers;
+      }
+    } catch {}
+  }
+
+  state.channelId = id;
+  state.channelName = name;
+  $('channelBar').hidden = false;
+  $('curChannel').textContent = name;
+  $('curTopic').textContent = topic || '';
+  $('emptyMain').textContent = '还没有人在共享画面';
+  applyMicUi();
+  renderChannels();
   connectSignaling();
 }
+
+function leaveChannel(rerender = true) {
+  if (state.screenStream) {
+    state.screenStream.getTracks().forEach((t) => t.stop());
+    state.screenStream = null;
+    $('shareBtn').setAttribute('aria-pressed', 'false');
+    $('shareBtn').querySelector('span').textContent = '共享屏幕';
+  }
+  for (const [, p] of state.peers) {
+    clearTimeout(p.recoverTimer);
+    p.pc?.close();
+    p.audioEl && (p.audioEl.srcObject = null);
+    p.tile?.remove();
+  }
+  state.peers.clear();
+  localTile?.remove();
+  localTile = null;
+  try {
+    state.ws?.close();
+  } catch {}
+  state.ws = null;
+  state.myId = null;
+  state.channelId = null;
+  state.channelName = '';
+  state.focusedId = null;
+  $('channelBar').hidden = true;
+  $('emptyMain').textContent = '← 选一个语音频道开始开黑';
+  $('emptyState').hidden = false;
+  $('rail').innerHTML = '';
+  if (rerender) renderChannels();
+}
+
+// 麦克风按钮 UI:无设备则禁用;有设备按静音态更新
+function applyMicUi() {
+  const b = $('micToggle');
+  if (!state.micTrack) {
+    b.disabled = true;
+    b.classList.add('is-off');
+    b.setAttribute('aria-pressed', 'false');
+    b.title = '未检测到麦克风';
+    return;
+  }
+  const muted = !state.micTrack.enabled;
+  b.disabled = false;
+  b.classList.toggle('is-off', muted);
+  b.setAttribute('aria-pressed', String(!muted));
+  b.title = muted ? '已静音' : '麦克风';
+}
+
+$('micToggle').addEventListener('click', () => {
+  if (!state.micTrack) return;
+  state.micTrack.enabled = !state.micTrack.enabled;
+  applyMicUi();
+});
 
 // 尝试获取麦克风;拿不到就返回 null(不阻塞进房)。
 // 关键:无麦克风的机器上 getUserMedia 可能长时间挂起而不报错,所以先探测设备并加超时兜底。
@@ -113,17 +237,11 @@ async function acquireMic() {
   }
 }
 
-function showLobbyError(text) {
-  const el = $('lobbyError');
-  el.textContent = text;
-  el.hidden = !text;
-}
-
 // ---------- 信令 ----------
 
 function connectSignaling() {
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-  const ws = new WebSocket(`${proto}://${location.host}/ws/${encodeURIComponent(state.room)}`);
+  const ws = new WebSocket(`${proto}://${location.host}/ws/${encodeURIComponent(state.channelId)}`);
   state.ws = ws;
 
   ws.onopen = () => ws.send(JSON.stringify({ type: 'join', name: state.myName }));
@@ -133,7 +251,7 @@ function connectSignaling() {
     switch (msg.type) {
       case 'welcome':
         state.myId = msg.id;
-        enterRoom();
+        renderMembers();
         // 新人主动向每个已有成员发起连接
         for (const p of msg.peers) {
           addPeer(p);
@@ -161,10 +279,7 @@ function connectSignaling() {
   };
 
   ws.onclose = () => {
-    if (document.getElementById('room').hidden) {
-      $('joinBtn').disabled = false;
-      showLobbyError('房间已满或连接失败,请稍后重试');
-    }
+    // 频道断开:被动断线由自愈逻辑处理,主动离开已清理
   };
 }
 
@@ -398,45 +513,9 @@ function stopShare() {
 
 // ---------- 麦克风 / 离开 ----------
 
-$('micBtn').addEventListener('click', () => {
-  if (!state.micTrack) return; // 无麦克风设备,按钮已禁用
-  const on = !(state.micTrack.enabled = !state.micTrack.enabled);
-  $('micBtn').setAttribute('aria-pressed', String(!on));
-  $('micBtn').classList.toggle('is-off', on);
-  $('micBtn').querySelector('span').textContent = on ? '已静音' : '麦克风';
-});
-
-$('leaveBtn').addEventListener('click', () => location.reload());
-
-$('copyLinkBtn').addEventListener('click', async () => {
-  const url = `${location.origin}/?room=${encodeURIComponent(state.room)}`;
-  try {
-    await navigator.clipboard.writeText(url);
-    $('copyLinkBtn').textContent = '已复制 ✓';
-    setTimeout(() => ($('copyLinkBtn').textContent = '复制邀请链接'), 1500);
-  } catch {
-    prompt('复制此链接发给朋友:', url);
-  }
-});
+$('leaveBtn').addEventListener('click', () => leaveChannel());
 
 // ---------- 成员与画面渲染 ----------
-
-function enterRoom() {
-  $('lobby').hidden = true;
-  $('room').hidden = false;
-  $('roomLabel').textContent = state.room;
-  history.replaceState(null, '', `/?room=${encodeURIComponent(state.room)}`);
-  if (!state.micTrack) {
-    const b = $('micBtn');
-    b.disabled = true;
-    b.classList.add('is-off');
-    b.setAttribute('aria-pressed', 'false');
-    b.title = '未检测到麦克风设备';
-    b.querySelector('span').textContent = '无麦克风';
-  }
-  renderMembers();
-  startStatsLoop();
-}
 
 function addPeer(p) {
   state.peers.set(p.id, { name: p.name, sharing: !!p.sharing, videoStream: null });
@@ -456,18 +535,23 @@ function removePeer(id) {
 }
 
 function renderMembers() {
-  const ul = $('memberList');
-  ul.innerHTML = '';
-  const me = document.createElement('li');
-  me.textContent = `${state.myName}(我)`;
-  me.classList.toggle('is-sharing', !!state.screenStream);
-  ul.appendChild(me);
-  for (const p of state.peers.values()) {
-    const li = document.createElement('li');
-    li.textContent = p.name;
-    li.classList.toggle('is-sharing', p.sharing);
-    ul.appendChild(li);
-  }
+  const box = document.getElementById('channelMembers');
+  if (!box) return;
+  box.innerHTML = '';
+  const add = (name, sharing, isMe) => {
+    const el = document.createElement('div');
+    el.className = 'cm-row';
+    el.classList.toggle('is-sharing', !!sharing);
+    const dot = document.createElement('span');
+    dot.className = 'cm-dot';
+    const nm = document.createElement('span');
+    nm.className = 'cm-name';
+    nm.textContent = isMe ? `${name}(我)` : name;
+    el.append(dot, nm);
+    box.appendChild(el);
+  };
+  if (state.channelId) add(state.myName, !!state.screenStream, true);
+  for (const p of state.peers.values()) add(p.name, p.sharing, false);
 }
 
 let localTile = null;
