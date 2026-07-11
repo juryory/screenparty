@@ -524,7 +524,7 @@ export class Guild extends DurableObject {
     const cat = newId();
     this.sql.exec('INSERT INTO categories (id, name, position) VALUES (?, ?, 0)', cat, '常规');
     this.sql.exec('INSERT INTO channels (id, category_id, name, type, position) VALUES (?, ?, ?, ?, 0)', newId(), cat, '大厅', 'voice');
-    this.sql.exec('INSERT INTO channels (id, category_id, name, type, position) VALUES (?, ?, ?, ?, 1)', newId(), cat, '闲聊', 'text');
+    this.sql.exec('INSERT INTO channels (id, category_id, name, type, position) VALUES (?, ?, ?, ?, 1)', newId(), cat, '游戏', 'voice');
   }
 
   roleOf(username) {
