@@ -66,6 +66,7 @@ async function loadGuild() {
   $('serverBadge').textContent = state.guild.guild.icon || '🎮';
   $('serverBadge').title = state.guild.guild.name;
   $('uRole').textContent = ROLE_LABEL[state.role] || '成员';
+  $('guildMenuBtn').hidden = !canManage();
   renderChannels();
 }
 
@@ -105,7 +106,10 @@ function renderChannels() {
   for (const cat of categories) {
     const head = document.createElement('div');
     head.className = 'cat-head';
-    head.textContent = cat.name;
+    const label = document.createElement('span');
+    label.textContent = cat.name;
+    head.appendChild(label);
+    if (canManage()) addCategoryActions(head, cat);
     list.appendChild(head);
     for (const ch of byCat.get(cat.id) || []) list.appendChild(channelItem(ch));
   }
@@ -121,6 +125,7 @@ function channelItem(ch) {
   row.innerHTML = `<span class="ch-glyph">${ch.type === 'text' ? '#' : '🔊'}</span><span class="ch-label"></span>`;
   row.querySelector('.ch-label').textContent = ch.name;
   if (ch.type !== 'text') row.addEventListener('click', () => joinChannel(ch.id, ch.name, ch.topic));
+  if (canManage()) addChannelActions(row, ch);
   wrap.appendChild(row);
   if (ch.id === state.channelId) {
     const mem = document.createElement('div');
@@ -260,9 +265,11 @@ function connectSignaling() {
         break;
       case 'peer-joined':
         addPeer(msg.peer); // 被动等待对方的 offer
+        blip(true);
         break;
       case 'peer-left':
         removePeer(msg.id);
+        blip(false);
         break;
       case 'peer-state': {
         const p = state.peers.get(msg.id);
@@ -720,4 +727,306 @@ function startStatsLoop() {
       }
     }
   }, 2000);
+}
+
+// ---------- 管理:弹窗 / 菜单 / 增删改(阶段 3) ----------
+
+function canManage() {
+  return state.role === 'owner' || state.role === 'admin';
+}
+
+async function api(method, path, body) {
+  try {
+    const r = await fetch(path, {
+      method,
+      headers: body ? { 'content-type': 'application/json' } : undefined,
+      body: body ? JSON.stringify(body) : undefined,
+    });
+    const data = await r.json().catch(() => ({}));
+    return { ok: r.ok, data, error: data.error };
+  } catch {
+    return { ok: false, error: '网络错误' };
+  }
+}
+
+// ---- 通用弹窗 ----
+let modalSubmit = null;
+function openModal(title, bodyEl, onOk, okLabel = '确定') {
+  $('modalTitle').textContent = title;
+  const body = $('modalBody');
+  body.innerHTML = '';
+  body.appendChild(bodyEl);
+  $('modalOk').textContent = okLabel;
+  modalSubmit = onOk; // 为 null 时,点确定/完成即关闭
+  $('modal').hidden = false;
+  body.querySelector('input, select, textarea')?.focus();
+}
+function closeModal() {
+  $('modal').hidden = true;
+  modalSubmit = null;
+}
+$('modalClose').addEventListener('click', closeModal);
+$('modalCancel').addEventListener('click', closeModal);
+$('modal').addEventListener('click', (e) => {
+  if (e.target.id === 'modal') closeModal();
+});
+$('modalOk').addEventListener('click', async () => {
+  if (!modalSubmit) return closeModal();
+  const keep = await modalSubmit();
+  if (keep !== false) closeModal();
+});
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape' && !$('modal').hidden) closeModal();
+});
+
+function field(labelText, input) {
+  const w = document.createElement('label');
+  w.className = 'field';
+  const t = document.createElement('span');
+  t.className = 'field-label';
+  t.textContent = labelText;
+  w.append(t, input);
+  return w;
+}
+function textInput(value = '', ph = '', maxLen = 32) {
+  const i = document.createElement('input');
+  i.className = 'field-input';
+  i.value = value;
+  i.placeholder = ph;
+  i.maxLength = maxLen;
+  return i;
+}
+function categorySelect(selId) {
+  const s = document.createElement('select');
+  s.className = 'field-input';
+  const none = document.createElement('option');
+  none.value = '';
+  none.textContent = '(未分类)';
+  s.appendChild(none);
+  for (const c of state.guild.categories) {
+    const o = document.createElement('option');
+    o.value = c.id;
+    o.textContent = c.name;
+    if (c.id === selId) o.selected = true;
+    s.appendChild(o);
+  }
+  return s;
+}
+
+// ---- 操作菜单 ----
+function openMenu(evt, items) {
+  const m = $('ctxMenu');
+  m.innerHTML = '';
+  for (const it of items) {
+    const b = document.createElement('button');
+    b.className = 'ctx-item' + (it.danger ? ' danger' : '');
+    b.textContent = it.label;
+    b.addEventListener('click', () => {
+      m.hidden = true;
+      it.fn();
+    });
+    m.appendChild(b);
+  }
+  m.hidden = false;
+  const w = m.offsetWidth || 180;
+  m.style.left = Math.min(evt.clientX, window.innerWidth - w - 8) + 'px';
+  m.style.top = Math.min(evt.clientY, window.innerHeight - m.offsetHeight - 8) + 'px';
+}
+document.addEventListener('click', () => ($('ctxMenu').hidden = true));
+
+// ---- 频道 / 分类的 hover 操作 ----
+function actionBtn(onClick) {
+  const b = document.createElement('button');
+  b.className = 'row-act';
+  b.textContent = '⋯';
+  b.title = '管理';
+  b.addEventListener('click', (e) => {
+    e.stopPropagation();
+    onClick(e);
+  });
+  return b;
+}
+function addChannelActions(row, ch) {
+  row.classList.add('has-act');
+  row.appendChild(
+    actionBtn((e) =>
+      openMenu(e, [
+        { label: '编辑频道', fn: () => openEditChannel(ch) },
+        { label: '删除频道', danger: true, fn: () => confirmDelete(`删除频道「${ch.name}」?`, () => deleteChannel(ch.id)) },
+      ]),
+    ),
+  );
+}
+function addCategoryActions(head, cat) {
+  head.classList.add('has-act');
+  head.appendChild(
+    actionBtn((e) =>
+      openMenu(e, [
+        { label: '在此分类新建频道', fn: () => openCreateChannel(cat.id) },
+        { label: '重命名分类', fn: () => openEditCategory(cat) },
+        { label: '删除分类', danger: true, fn: () => confirmDelete(`删除分类「${cat.name}」?其中的频道会移到未分类。`, () => deleteCategory(cat.id)) },
+      ]),
+    ),
+  );
+}
+
+// ---- 服务器管理菜单 ----
+$('guildMenuBtn').addEventListener('click', (e) => {
+  e.stopPropagation();
+  const items = [
+    { label: '服务器设置', fn: openServerSettings },
+    { label: '新建频道', fn: () => openCreateChannel(null) },
+    { label: '新建分类', fn: openCreateCategory },
+  ];
+  if (state.role === 'owner') items.push({ label: '成员与角色', fn: openMembers });
+  openMenu(e, items);
+});
+
+// ---- 具体操作 ----
+function openServerSettings() {
+  const g = state.guild.guild;
+  const name = textInput(g.name, '服务器名', 32);
+  const icon = textInput(g.icon, '一个 emoji', 4);
+  const desc = textInput(g.description, '描述(可选)', 200);
+  const body = document.createElement('div');
+  body.append(field('服务器名', name), field('图标(emoji)', icon), field('描述', desc));
+  openModal('服务器设置', body, async () => {
+    if (!name.value.trim()) return false;
+    const r = await api('PATCH', '/api/guild', { name: name.value.trim(), icon: icon.value.trim(), description: desc.value.trim() });
+    if (!r.ok) return (alert(r.error || '保存失败'), false);
+    await loadGuild();
+  }, '保存');
+}
+
+function openCreateChannel(categoryId) {
+  const name = textInput('', '频道名', 24);
+  const cat = categorySelect(categoryId || '');
+  const body = document.createElement('div');
+  body.append(field('频道名', name), field('所属分类', cat));
+  openModal('新建语音频道', body, async () => {
+    if (!name.value.trim()) return false;
+    const r = await api('POST', '/api/channels', { name: name.value.trim(), type: 'voice', categoryId: cat.value || null });
+    if (!r.ok) return (alert(r.error || '创建失败'), false);
+    await loadGuild();
+  }, '创建');
+}
+
+function openEditChannel(ch) {
+  const name = textInput(ch.name, '频道名', 24);
+  const topic = textInput(ch.topic || '', '频道简介(可选)', 120);
+  const cat = categorySelect(ch.categoryId || '');
+  const body = document.createElement('div');
+  body.append(field('频道名', name), field('简介', topic), field('所属分类', cat));
+  openModal('编辑频道', body, async () => {
+    if (!name.value.trim()) return false;
+    const r = await api('PATCH', '/api/channels/' + ch.id, { name: name.value.trim(), topic: topic.value.trim(), categoryId: cat.value || null });
+    if (!r.ok) return (alert(r.error || '保存失败'), false);
+    if (state.channelId === ch.id) $('curChannel').textContent = name.value.trim();
+    await loadGuild();
+  }, '保存');
+}
+
+async function deleteChannel(id) {
+  const r = await api('DELETE', '/api/channels/' + id);
+  if (!r.ok) return alert(r.error || '删除失败');
+  if (state.channelId === id) leaveChannel(false);
+  await loadGuild();
+}
+
+function openCreateCategory() {
+  const name = textInput('', '分类名', 24);
+  const body = document.createElement('div');
+  body.append(field('分类名', name));
+  openModal('新建分类', body, async () => {
+    if (!name.value.trim()) return false;
+    const r = await api('POST', '/api/categories', { name: name.value.trim() });
+    if (!r.ok) return (alert(r.error || '创建失败'), false);
+    await loadGuild();
+  }, '创建');
+}
+
+function openEditCategory(cat) {
+  const name = textInput(cat.name, '分类名', 24);
+  const body = document.createElement('div');
+  body.append(field('分类名', name));
+  openModal('重命名分类', body, async () => {
+    if (!name.value.trim()) return false;
+    const r = await api('PATCH', '/api/categories/' + cat.id, { name: name.value.trim() });
+    if (!r.ok) return (alert(r.error || '保存失败'), false);
+    await loadGuild();
+  }, '保存');
+}
+
+async function deleteCategory(id) {
+  const r = await api('DELETE', '/api/categories/' + id);
+  if (!r.ok) return alert(r.error || '删除失败');
+  await loadGuild();
+}
+
+function confirmDelete(msg, fn) {
+  const body = document.createElement('div');
+  body.className = 'confirm-msg';
+  body.textContent = msg;
+  openModal('确认删除', body, async () => {
+    await fn();
+  }, '删除');
+}
+
+async function openMembers() {
+  const r = await api('GET', '/api/members');
+  const body = document.createElement('div');
+  body.className = 'member-list';
+  for (const m of r.data.members || []) {
+    const row = document.createElement('div');
+    row.className = 'member-row';
+    const nm = document.createElement('span');
+    nm.className = 'member-name';
+    nm.textContent = `${m.nickname} (${m.username})`;
+    row.appendChild(nm);
+    if (m.role === 'owner' || state.role !== 'owner') {
+      const tag = document.createElement('span');
+      tag.className = 'role-tag' + (m.role === 'owner' ? ' role-owner' : '');
+      tag.textContent = ROLE_LABEL[m.role] || '成员';
+      row.appendChild(tag);
+    } else {
+      const sel = document.createElement('select');
+      sel.className = 'field-input role-sel';
+      for (const [val, label] of [['admin', '管理员'], ['member', '成员']]) {
+        const o = document.createElement('option');
+        o.value = val;
+        o.textContent = label;
+        if (m.role === val) o.selected = true;
+        sel.appendChild(o);
+      }
+      sel.addEventListener('change', async () => {
+        const rr = await api('PATCH', '/api/members/' + encodeURIComponent(m.username), { role: sel.value });
+        if (!rr.ok) alert(rr.error || '修改失败');
+      });
+      row.appendChild(sel);
+    }
+    body.appendChild(row);
+  }
+  if (!(r.data.members || []).length) body.textContent = '暂无成员';
+  openModal('成员与角色', body, null, '完成');
+}
+
+// ---------- 加入/离开提示音(阶段 4) ----------
+function blip(up) {
+  if (!state.channelId) return;
+  try {
+    const AC = window.AudioContext || window.webkitAudioContext;
+    const ac = (blip.ac ||= new AC());
+    const o = ac.createOscillator();
+    const g = ac.createGain();
+    o.type = 'sine';
+    o.frequency.value = up ? 660 : 400;
+    o.connect(g);
+    g.connect(ac.destination);
+    const t = ac.currentTime;
+    g.gain.setValueAtTime(0.0001, t);
+    g.gain.exponentialRampToValueAtTime(0.12, t + 0.02);
+    g.gain.exponentialRampToValueAtTime(0.0001, t + 0.25);
+    o.start(t);
+    o.stop(t + 0.26);
+  } catch {}
 }

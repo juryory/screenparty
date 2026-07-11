@@ -28,6 +28,7 @@
   //   wrangler secret put ADMIN_USERNAME
   //   wrangler secret put ADMIN_PASSWORD
   //   wrangler secret put ADMIN_NICKNAME   // 可选,缺省用用户名
+  //   wrangler secret put GUILD_NAME       // 可选,服务器显示名(ADMIN_USERNAME 即所有者)
   // 本地开发把它们写进 .dev.vars(已被 .gitignore 忽略)
   //
   // 可选:接入 Cloudflare Realtime TURN 作打洞失败兜底

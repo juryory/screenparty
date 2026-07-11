@@ -5,6 +5,7 @@
 - 画面与语音在成员之间 **WebRTC P2P 直连**,不经过任何服务器,走各自家宽,同城延迟通常 5–30ms
 - Cloudflare 只承担信令(进房间时交换连接信息的几 KB 流量),全部落在免费额度内
 - 账号鉴权:仅管理员分配的账号可登录使用,**禁止匿名与自助注册**(适合固定的开黑小圈子)
+- **Discord / TeamSpeak 式界面**:服务器 → 分类 → 语音频道;角色分「所有者 / 管理员 / 成员」,管理员可在网页里直接建/改/删频道、改服务器信息、管成员角色
 - 每路屏幕最高 1080p30,针对游戏画面优化(H.264 硬编优先、运动内容提示、保帧率降级)
 - 每个画面角落实时显示 分辨率 / 帧率 / 码率,方便排查网络问题
 
@@ -19,21 +20,23 @@ wrangler deploy
 
 部署完成后输出一个 `https://screenparty.<你的子域>.workers.dev` 地址。**首次部署后还需配置管理员账号(见第二节),否则无人能登录。**
 
-> **建议绑定自定义域名**:`*.workers.dev` 在国内偶发 DNS 污染。在 Cloudflare dashboard → Workers → screenparty → Settings → Domains & Routes 添加你自己的域名(你做投注平台用过的域名加个子域即可)。
+> **建议绑定自定义域名**:`*.workers.dev` 在国内偶发 DNS 污染。在 Cloudflare dashboard → Workers → screenparty → Settings → Domains & Routes 添加你自己的域名(任意已托管在 Cloudflare 的域名加个子域即可)。`wrangler.jsonc` 里的 `routes` 硬编码了一个示例域名,自部署时改成你自己的或删掉该字段。
 
 ## 二、账号鉴权(必配)
 
 系统禁止匿名使用和自助注册:必须先有账号才能进房间。管理员账号通过 Cloudflare Secret 注入,首次访问时自动创建。
 
 ```bash
-wrangler secret put ADMIN_USERNAME   # 例如 admin
+wrangler secret put ADMIN_USERNAME   # 例如 admin,该账号同时成为服务器「所有者」
 wrangler secret put ADMIN_PASSWORD   # 至少 6 位,建议用强密码
-wrangler secret put ADMIN_NICKNAME   # 可选,房间里显示的名字,缺省用用户名
+wrangler secret put ADMIN_NICKNAME   # 可选,显示的名字,缺省用用户名
 wrangler deploy                       # 重新部署使其生效
 ```
 
-- **本地开发**:把上面三项写进项目根目录的 `.dev.vars`(已被 `.gitignore` 忽略,不会提交),再 `npm run dev`。
-- **管理其他用户**:用管理员登录后,点击大厅的「用户管理」进入 `/admin.html`,可**新增 / 改昵称 / 重置密码 / 启用停用 / 删除**普通用户。普通用户无管理权限,进房间的昵称由管理员设定、用户不可改。
+- **本地开发**:复制 `.dev.vars.example` 为 `.dev.vars`(已被 `.gitignore` 忽略,不会提交)填好,再 `npm run dev`。可选 `GUILD_NAME` 设置服务器显示名。
+- **角色与权限**:`ADMIN_USERNAME` 是服务器**所有者**(唯一,可任命管理员);**管理员**能建/改/删频道分类、改服务器信息;**成员**只能进频道开黑。角色在网页左下用户面板 → 设置,或服务器名旁的 ⌄ 菜单 →「成员与角色」里管理(仅所有者可改)。
+- **频道管理**:所有者/管理员在频道名上 hover 出现 `⋯`,或用服务器 ⌄ 菜单新建频道/分类、编辑、删除。
+- **管理其他账号**:用管理员登录后,左下用户面板 → 设置齿轮 →「用户管理」进入 `/admin.html`,可**新增 / 改昵称 / 重置密码 / 启用停用 / 删除**普通用户。进房间的昵称由管理员设定、用户不可改。
 - **安全说明**:密码仅以 PBKDF2 加盐哈希存储(不留明文),会话走 `HttpOnly; Secure` Cookie;停用或删除用户会立即使其在线会话失效。管理员账号一旦创建,改密走管理界面,再改环境变量不会覆盖已有账号。
 
 ## 三、放到 GitHub(可选,推荐)
@@ -213,7 +216,15 @@ wrangler deploy
 ## 架构
 
 ```
-浏览器 ──(WSS 信令,仅建连时)──► Cloudflare Worker ──► Durable Object(每房间一个)
-   │
+浏览器 ──(WSS 信令,仅建连时)──► Cloudflare Worker ──► Durable Object
+   │                                                    ├─ Room(每频道一个:信令中转)
+   │                                                    ├─ Auth(单例:账号 / 会话)
+   │                                                    └─ Guild(单例:服务器 / 分类 / 频道 / 角色)
    └──(音视频,持续)──► 其他成员浏览器(WebRTC P2P 直连,打洞失败走 TURN)
 ```
+
+全部 Durable Object 均为 SQLite 存储,Workers 免费计划即可运行。
+
+## 许可证
+
+[MIT](./LICENSE) © juryory

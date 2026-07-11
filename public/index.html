@@ -42,6 +42,7 @@
   <section class="channels">
     <header class="guild-head">
       <span class="guild-name" id="guildName">ScreenParty</span>
+      <button id="guildMenuBtn" class="guild-menu-btn" title="服务器管理" hidden>⌄</button>
     </header>
     <div class="channel-scroll" id="channelList"></div>
   </section>
@@ -73,6 +74,24 @@
       <aside id="rail" aria-label="其他画面"></aside>
     </div>
   </main>
+
+  <!-- 通用弹窗 -->
+  <div id="modal" class="modal-overlay" hidden>
+    <div class="modal">
+      <header class="modal-head">
+        <span id="modalTitle"></span>
+        <button id="modalClose" class="icon-btn" title="关闭">✕</button>
+      </header>
+      <div id="modalBody" class="modal-body"></div>
+      <footer class="modal-foot">
+        <button id="modalCancel" class="btn-ghost">取消</button>
+        <button id="modalOk" class="btn-primary">确定</button>
+      </footer>
+    </div>
+  </div>
+
+  <!-- 右键 / 操作菜单 -->
+  <div id="ctxMenu" class="ctx-menu" hidden></div>
 </div>
 
 <template id="tileTemplate">

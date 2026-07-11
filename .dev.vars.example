@@ -1,0 +1,19 @@
+# 本地开发变量样例(复制为 .dev.vars;.dev.vars 已被 .gitignore 忽略,勿提交真实值)
+# 生产环境请用 `wrangler secret put <名字>` 或 Cloudflare dashboard 设置。
+
+# 首次运行会用下面的账号播种管理员(同时成为服务器「所有者」)
+ADMIN_USERNAME=admin
+ADMIN_PASSWORD=change-me-please
+ADMIN_NICKNAME=管理员
+
+# 服务器显示名(可选,缺省 ScreenParty)
+GUILD_NAME=ScreenParty
+
+# 可选:自建 coturn 兜底(留空则只用 STUN,打洞失败可能连不上)
+# COTURN_HOST=your.public.ip.or.domain
+# COTURN_SECRET=your-static-auth-secret
+# COTURN_TLS_HOST=turn.your.domain
+
+# 可选:Cloudflare Realtime TURN(免费兜底,境外节点)
+# TURN_KEY_ID=
+# TURN_KEY_API_TOKEN=
