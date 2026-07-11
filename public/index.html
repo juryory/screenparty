@@ -32,6 +32,9 @@
           <button id="micToggle" class="icon-btn" aria-pressed="true" title="麦克风">
             <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path fill="currentColor" d="M12 14a3 3 0 0 0 3-3V6a3 3 0 1 0-6 0v5a3 3 0 0 0 3 3Zm5-3a5 5 0 0 1-10 0H5a7 7 0 0 0 6 6.92V21h2v-3.08A7 7 0 0 0 19 11h-2Z"/></svg>
           </button>
+          <button id="camBtn" class="icon-btn" aria-pressed="false" title="摄像头">
+            <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path fill="currentColor" d="M4 6h11a1 1 0 0 1 1 1v2.5l4-3v11l-4-3V17a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1Z"/></svg>
+          </button>
           <button id="settingsBtn" class="icon-btn" title="设置" aria-haspopup="true" aria-expanded="false">
             <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path fill="currentColor" d="M12 8a4 4 0 1 0 0 8 4 4 0 0 0 0-8Zm8.94 4a7.5 7.5 0 0 0-.1-1.2l2-1.56-2-3.46-2.36.95a7.4 7.4 0 0 0-2.08-1.2L15.9 2h-4l-.4 2.53a7.4 7.4 0 0 0-2.08 1.2L7.06 4.8l-2 3.46 2 1.56a7.6 7.6 0 0 0 0 2.4l-2 1.56 2 3.46 2.36-.95c.62.5 1.32.9 2.08 1.2L12 22h4l.4-2.53a7.4 7.4 0 0 0 2.08-1.2l2.36.95 2-3.46-2-1.56c.06-.4.1-.8.1-1.2Z"/></svg>
           </button>
@@ -56,10 +59,6 @@
       <span class="ch-name" id="curChannel"></span>
       <span class="ch-topic" id="curTopic"></span>
       <div class="bar-fill"></div>
-      <button id="camBtn" class="ctl ctl-cam" aria-pressed="false">
-        <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><path fill="currentColor" d="M4 6h11a1 1 0 0 1 1 1v2.5l4-3v11l-4-3V17a1 1 0 0 1-1 1H4a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1Z"/></svg>
-        <span>摄像头</span>
-      </button>
       <button id="shareBtn" class="ctl ctl-share" aria-pressed="false">
         <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><path fill="currentColor" d="M4 5h16a1 1 0 0 1 1 1v10a1 1 0 0 1-1 1h-6v2h3v2H7v-2h3v-2H4a1 1 0 0 1-1-1V6a1 1 0 0 1 1-1Zm1 2v8h14V7H5Z"/></svg>
         <span>共享屏幕</span>
@@ -103,6 +102,7 @@
 <template id="tileTemplate">
   <figure class="tile">
     <video playsinline autoplay></video>
+    <div class="tile-route" aria-hidden="true"></div>
     <div class="tile-stats" aria-hidden="true"></div>
     <figcaption class="umd">
       <span class="umd-name"></span>

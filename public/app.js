@@ -23,6 +23,7 @@ const state = {
   micTrack: null,
   screenStream: null,
   camStream: null,
+  presence: {}, // channelId -> 当前人数(轮询 /api/presence)
   peers: new Map(), // id -> { name, sharing, camera, pc, senders, tile, camTile, videoStream, camStream, audioEl, sendQuality, viewReq }
   focusedId: null,  // 当前主舞台显示谁:peer id / id+':cam' / 'local' / 'local:cam' / null
 };
@@ -80,15 +81,37 @@ async function bootstrapAuth() {
   $('adminLink').hidden = !me.isAdmin;
   applyShareUi();
   await loadGuild();
+  loadPresence();
+  setInterval(loadPresence, 10_000); // 频道人数轮询
   startStatsLoop();
 }
 
-// 无共享权限:按钮禁用并提示(服务端同样会拦截,这里只是界面反馈)
-function applyShareUi() {
-  for (const b of [$('shareBtn'), $('camBtn')]) {
-    b.disabled = !state.canShare;
-    b.title = state.canShare ? '' : '共享权限未开启,请联系管理员在用户管理中开启';
+// 拉各频道当前人数;自己所在频道用本地实时数(state.peers),其余用轮询结果
+async function loadPresence() {
+  try {
+    const r = await fetch('/api/presence');
+    if (!r.ok) return;
+    state.presence = (await r.json()).counts || {};
+  } catch {
+    return;
   }
+  renderChannels();
+}
+
+function channelCount(id) {
+  if (id === state.channelId && state.myId) return state.peers.size + 1;
+  return state.presence[id] || 0;
+}
+
+// 共享按钮可用性:无权限禁用并提示(服务端同样会拦截,这里只是界面反馈);
+// 摄像头按钮常驻左下角,还需进了频道才可用
+function applyShareUi() {
+  const noPerm = '共享权限未开启,请联系管理员在用户管理中开启';
+  $('shareBtn').disabled = !state.canShare;
+  $('shareBtn').title = state.canShare ? '' : noPerm;
+  const cam = $('camBtn');
+  cam.disabled = !state.canShare || !state.channelId;
+  cam.title = !state.canShare ? noPerm : !state.channelId ? '进入频道后可开启摄像头' : state.camStream ? '关闭摄像头' : '摄像头';
 }
 
 // 拉服务器结构(名称/图标/分类/频道/我的角色)并渲染频道列表
@@ -152,6 +175,7 @@ function renderChannels() {
     list.appendChild(head);
     for (const ch of byCat.get(cat.id) || []) list.appendChild(channelItem(ch));
   }
+  renderMembers(); // 重画后补回当前频道的成员列表(channelMembers 容器是新建的空盒子)
 }
 
 function channelItem(ch) {
@@ -161,8 +185,10 @@ function channelItem(ch) {
   row.className = 'channel-row';
   row.dataset.channel = ch.id;
   row.classList.toggle('is-active', ch.id === state.channelId);
-  row.innerHTML = `<span class="ch-glyph">${ch.type === 'text' ? '#' : '🔊'}</span><span class="ch-label"></span>`;
-  row.querySelector('.ch-label').textContent = ch.name;
+  row.innerHTML = `<span class="ch-glyph">${ch.type === 'text' ? '#' : '🔊'}</span><span class="ch-label"><span class="ch-name-txt"></span><span class="ch-count"></span></span>`;
+  row.querySelector('.ch-name-txt').textContent = ch.name;
+  const n = channelCount(ch.id);
+  row.querySelector('.ch-count').textContent = n ? ` (${n})` : '';
   if (ch.type !== 'text') row.addEventListener('click', () => joinChannel(ch.id, ch.name, ch.topic));
   if (canManage()) addChannelActions(row, ch);
   wrap.appendChild(row);
@@ -200,6 +226,7 @@ async function joinChannel(id, name, topic) {
   $('curTopic').textContent = topic || '';
   $('emptyMain').textContent = '还没有人在共享画面';
   applyMicUi();
+  applyShareUi();
   startMeter();
   renderChannels();
   connectSignaling();
@@ -239,6 +266,7 @@ function leaveChannel(rerender = true) {
   state.channelName = '';
   state.focusedId = null;
   $('channelBar').hidden = true;
+  applyShareUi();
   $('emptyMain').textContent = '← 选一个语音频道开始开黑';
   $('emptyState').hidden = false;
   $('rail').innerHTML = '';
@@ -349,6 +377,7 @@ function connectSignaling() {
   ws.onopen = () => ws.send(JSON.stringify({ type: 'join', name: state.myName }));
 
   ws.onmessage = async (e) => {
+    if (state.ws !== ws) return; // 快速切频道时旧连接的迟到消息,直接丢弃
     const msg = JSON.parse(e.data);
     switch (msg.type) {
       case 'welcome':
@@ -383,8 +412,11 @@ function connectSignaling() {
     }
   };
 
-  ws.onclose = () => {
-    // 频道断开:被动断线由自愈逻辑处理,主动离开已清理
+  ws.onclose = (e) => {
+    if (state.ws !== ws) return;
+    // 同账号在别处进了频道,本连接被服务器顶掉:退出本地频道状态
+    // (其他断线不动:媒体是 P2P 的,信令断开不影响通话,由自愈逻辑处理)
+    if (e.reason === 'replaced') leaveChannel();
   };
 }
 
@@ -684,8 +716,10 @@ function stopCamera() {
 }
 
 function camUi(on) {
-  $('camBtn').setAttribute('aria-pressed', String(on));
-  $('camBtn').querySelector('span').textContent = on ? '关摄像头' : '摄像头';
+  const b = $('camBtn');
+  b.setAttribute('aria-pressed', String(on));
+  b.classList.toggle('is-on', on);
+  applyShareUi();
 }
 
 async function attachCameraTo(peer) {
@@ -747,6 +781,10 @@ function renderMembers() {
   };
   if (state.channelId) add(state.myName, !!state.screenStream, true, !!state.camStream);
   for (const p of state.peers.values()) add(p.name, p.sharing, false, p.camera);
+
+  // 同步更新当前频道行的人数(成员进出时即时变化,不等轮询)
+  const countEl = document.querySelector(`.channel-row[data-channel="${state.channelId}"] .ch-count`);
+  if (countEl) countEl.textContent = ` (${state.peers.size + 1})`;
 }
 
 let localTile = null;
@@ -889,6 +927,7 @@ function makePlaceholder(name, key) {
   tile.classList.add('is-placeholder');
   tile.dataset.key = key;
   tile.querySelector('video').remove();
+  tile.querySelector('.tile-route').remove(); // 无画面不显示线路角标
   const ph = document.createElement('div');
   ph.className = 'ph-body';
   ph.textContent = name.slice(0, 2);
@@ -934,6 +973,31 @@ function startStatsLoop() {
             }
           }
         });
+
+        // 线路指示:当前选中的候选对里任一端是 relay = 走 TURN 中继,否则 P2P 直连
+        let route = '';
+        let isRelay = false;
+        let pair = null;
+        stats.forEach((s) => {
+          if (s.type === 'transport' && s.selectedCandidatePairId) pair = stats.get(s.selectedCandidatePairId);
+        });
+        if (!pair)
+          stats.forEach((s) => {
+            if (s.type === 'candidate-pair' && s.nominated && s.state === 'succeeded') pair = s;
+          });
+        if (pair) {
+          const lc = stats.get(pair.localCandidateId) || {};
+          const rc = stats.get(pair.remoteCandidateId) || {};
+          isRelay = lc.candidateType === 'relay' || rc.candidateType === 'relay';
+          route = isRelay ? 'TURN中继' : 'P2P直连';
+        }
+        for (const t of [p.tile, p.camTile]) {
+          const el = t?.querySelector('.tile-route');
+          if (el) {
+            el.textContent = route;
+            el.classList.toggle('is-relay', isRelay);
+          }
+        }
       } catch {}
     }
     // 本地上行码率

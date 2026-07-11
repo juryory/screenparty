@@ -183,6 +183,25 @@ export default {
       return env.ROOM.get(id).fetch(new Request(request, { headers }));
     }
 
+    // 各频道当前人数(频道列表显示「大厅 (5)」):逐个问询 Room DO
+    if (url.pathname === '/api/presence') {
+      const user = await auth.verify(getCookie(request, SESSION_COOKIE));
+      if (!user) return Response.json({ error: 'unauthorized' }, { status: 401 });
+      const guild = env.GUILD.get(env.GUILD.idFromName('global'));
+      const { channels } = await guild.tree();
+      const entries = await Promise.all(
+        channels.map(async (ch) => {
+          try {
+            const r = await env.ROOM.get(env.ROOM.idFromName(ch.id)).fetch('https://room/count');
+            return [ch.id, (await r.json()).count || 0];
+          } catch {
+            return [ch.id, 0];
+          }
+        }),
+      );
+      return Response.json({ counts: Object.fromEntries(entries) });
+    }
+
     // TURN 临时凭证:同样需登录,杜绝匿名占用中继带宽
     if (url.pathname === '/api/turn') {
       const user = await auth.verify(getCookie(request, SESSION_COOKIE));
@@ -672,17 +691,22 @@ export class Room {
   }
 
   async fetch(request) {
+    // 非 WebSocket 请求 = 内部人数查询(/api/presence)
+    if (request.headers.get('Upgrade') !== 'websocket') {
+      return Response.json({ count: this.roster().length });
+    }
     const peers = this.state.getWebSockets();
     if (peers.length >= MAX_PEERS) {
       return new Response('room full', { status: 409 });
     }
-    // 可信昵称/权限由 Worker 鉴权后注入,客户端无法伪造
+    // 可信昵称/账号/权限由 Worker 鉴权后注入,客户端无法伪造
     const nick = decodeURIComponent(request.headers.get('X-SP-Nick') || '') || '玩家';
+    const user = request.headers.get('X-SP-User') || '';
     const canShare = request.headers.get('X-SP-Share') === '1';
     const pair = new WebSocketPair();
     // Hibernation API:空闲时 DO 休眠,不消耗运行时配额
     this.state.acceptWebSocket(pair[1]);
-    pair[1].serializeAttachment({ nick, canShare });
+    pair[1].serializeAttachment({ nick, user, canShare });
     return new Response(null, { status: 101, webSocket: pair[0] });
   }
 
@@ -699,10 +723,26 @@ export class Room {
         const att = ws.deserializeAttachment() || {};
         const id = crypto.randomUUID().slice(0, 8);
         const name = att.nick || '玩家'; // 用服务端可信昵称,忽略 msg.name
-        ws.serializeAttachment({ id, name, canShare: !!att.canShare, sharing: false, camera: false });
+
+        // 一账号一席:快速切频道时旧连接可能还没走完关闭握手(或同账号多开),
+        // 会在成员列表里留下"分身"。踢掉旧连接并广播其离开。
+        const kicked = new Set();
+        for (const s of this.state.getWebSockets()) {
+          if (s === ws) continue;
+          const a = s.deserializeAttachment();
+          if (a && a.id && a.user && a.user === att.user) {
+            kicked.add(a.id);
+            this.broadcast({ type: 'peer-left', id: a.id }, s);
+            try {
+              s.close(1000, 'replaced');
+            } catch {}
+          }
+        }
+
+        ws.serializeAttachment({ id, name, user: att.user, canShare: !!att.canShare, sharing: false, camera: false });
 
         // 告知新人:自己的 id + 房间里已有哪些人(新人将向他们逐一发起连接)
-        const others = this.roster().filter((p) => p.id !== id);
+        const others = this.roster().filter((p) => p.id !== id && !kicked.has(p.id));
         ws.send(JSON.stringify({ type: 'welcome', id, peers: others }));
 
         this.broadcast({ type: 'peer-joined', peer: { id, name, sharing: false, camera: false } }, ws);
