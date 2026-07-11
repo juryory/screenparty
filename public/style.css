@@ -419,7 +419,30 @@ button:focus-visible, input:focus-visible { outline: 2px solid var(--amber); out
   .app { grid-template-columns: 200px 1fr; }
   .userbar-text { display: none; }
 }
+
+/* 手机端:单栏 + 频道抽屉(Discord 手机版式) */
+.drawer-btn { display: none; }
+.drawer-backdrop { display: none; position: fixed; inset: 0; background: rgba(0, 0, 0, 0.55); z-index: 25; }
+
 @media (max-width: 640px) {
+  .app { grid-template-columns: 1fr; }
+  .channels {
+    position: fixed;
+    top: 0; bottom: 0; left: 0;
+    width: min(78vw, 300px);
+    z-index: 30;
+    transform: translateX(-105%);
+    transition: transform 0.2s ease;
+    box-shadow: 4px 0 24px rgba(0, 0, 0, 0.5);
+  }
+  .app.drawer-open .channels { transform: translateX(0); }
+  .app.drawer-open .drawer-backdrop { display: block; }
+  .drawer-btn { display: flex; flex: 0 0 auto; }
+  .userbar-text { display: flex; } /* 抽屉够宽,恢复昵称显示 */
+  .ctl span { display: none; }     /* 顶栏按钮只留图标 */
+  .ch-topic { display: none; }
+  .ch-name { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+
   .stage-wrap { flex-direction: column; }
   #rail { flex: 0 0 auto; flex-direction: row; width: 100%; overflow-x: auto; overflow-y: hidden; }
   #rail .tile { width: 140px; flex: 0 0 140px; }

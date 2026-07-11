@@ -81,6 +81,7 @@ async function bootstrapAuth() {
   $('uAvatar').textContent = me.nickname.slice(0, 2);
   $('adminLink').hidden = !me.isAdmin;
   applyShareUi();
+  setDrawer(true); // 手机端初始展开频道抽屉
   await loadGuild();
   loadPresence();
   setInterval(loadPresence, 10_000); // 频道人数轮询
@@ -132,6 +133,17 @@ async function loadGuild() {
   $('guildMenuBtn').hidden = !canManage();
   renderChannels();
 }
+
+// ---------- 手机端频道抽屉 ----------
+// ≤640px 时频道栏是抽屉(CSS 控制,桌面端此 class 无效果)。
+// 没进频道时保持展开(否则满屏空舞台无处可点),进频道自动收起。
+function setDrawer(open) {
+  $('app').classList.toggle('drawer-open', open);
+}
+$('drawerBtn').addEventListener('click', () => setDrawer(true));
+$('drawerBackdrop').addEventListener('click', () => {
+  if (state.channelId) setDrawer(false);
+});
 
 // 设置菜单(退出登录 / 用户管理)
 $('settingsBtn').addEventListener('click', () => {
@@ -248,6 +260,7 @@ async function joinChannel(id, name, topic) {
   applyMicUi();
   applyShareUi();
   startMeter();
+  setDrawer(false); // 进频道收起抽屉,把屏幕让给画面
   renderChannels();
   connectSignaling();
 }
@@ -287,6 +300,7 @@ function leaveChannel(rerender = true) {
   state.focusedId = null;
   $('channelBar').hidden = true;
   applyShareUi();
+  setDrawer(true); // 离开频道重新展开抽屉(手机端)
   $('emptyMain').textContent = '← 选一个语音频道开始开黑';
   $('emptyState').hidden = false;
   $('rail').innerHTML = '';

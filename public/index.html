@@ -52,9 +52,15 @@
     </footer>
   </section>
 
+  <!-- 手机端:频道抽屉的遮罩 -->
+  <div id="drawerBackdrop" class="drawer-backdrop"></div>
+
   <!-- 第二栏:主区 -->
   <main class="stage-col">
     <header class="topbar" id="channelBar" hidden>
+      <button id="drawerBtn" class="icon-btn drawer-btn" title="频道列表">
+        <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><path fill="currentColor" d="M3 6h18v2H3V6Zm0 5h18v2H3v-2Zm0 5h18v2H3v-2Z"/></svg>
+      </button>
       <span class="ch-ico" aria-hidden="true">🔊</span>
       <span class="ch-name" id="curChannel"></span>
       <span class="ch-topic" id="curTopic"></span>
@@ -73,7 +79,7 @@
       <div id="stage" class="stage">
         <div id="emptyState" class="empty">
           <p id="emptyMain">← 选一个语音频道开始开黑</p>
-          <p class="empty-sub">进频道后点「共享屏幕」把画面播给大家;右侧点缩略图切换主画面</p>
+          <p class="empty-sub">进频道后点「共享屏幕」把画面播给大家;点缩略图切换主画面</p>
         </div>
       </div>
       <aside id="rail" aria-label="其他画面"></aside>
