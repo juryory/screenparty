@@ -379,25 +379,16 @@ function prefDevice(key) {
 }
 
 // 尝试获取麦克风;拿不到就返回 null(不阻塞进房)。
-// 关键:无麦克风的机器上 getUserMedia 可能长时间挂起而不报错,所以先探测设备并加超时兜底。
+// 不设短超时:移动端弹授权框 + 用户手动点「允许」常超过几秒,超时会把已授权的麦克风
+// 误判为无设备丢弃,导致"允许了却说不了话"。无麦克风机器靠 getUserMedia 自身报错处理。
 async function acquireMic() {
   try {
-    const devices = await navigator.mediaDevices.enumerateDevices();
-    if (!devices.some((d) => d.kind === 'audioinput')) return null; // 没有麦克风设备,直接跳过
-  } catch {}
-  const micPromise = navigator.mediaDevices.getUserMedia({
-    audio: { deviceId: prefDevice('sp_micId'), echoCancellation: true, noiseSuppression: true, autoGainControl: true },
-  });
-  try {
-    const stream = await Promise.race([
-      micPromise,
-      new Promise((_, reject) => setTimeout(() => reject(new Error('mic-timeout')), 6000)),
-    ]);
+    const stream = await navigator.mediaDevices.getUserMedia({
+      audio: { deviceId: prefDevice('sp_micId'), echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+    });
     return stream.getAudioTracks()[0] || null;
   } catch {
-    // 超时后 getUserMedia 若迟到 resolve,顺手停掉,避免麦克风一直被占用(地址栏图标常亮)
-    micPromise.then((s) => s.getTracks().forEach((t) => t.stop())).catch(() => {});
-    return null; // 拒绝授权 / 无设备 / 超时:均按无麦克风处理
+    return null; // 拒绝授权 / 无麦克风设备:按无麦克风处理(仍可共享/观看/收听)
   }
 }
 
