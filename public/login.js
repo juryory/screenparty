@@ -15,7 +15,9 @@ const params = new URLSearchParams(location.search);
 })();
 
 function go() {
-  const room = params.get('room');
+  const c = params.get('c'); // 邀请链接里的频道 id:登录/注册后自动跳回该频道
+  if (c) return location.replace(`/?c=${encodeURIComponent(c)}`);
+  const room = params.get('room'); // 兼容旧的 ?room= 链接
   location.replace(room ? `/?room=${encodeURIComponent(room)}` : '/');
 }
 

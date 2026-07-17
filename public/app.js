@@ -72,7 +72,11 @@ async function bootstrapAuth() {
     const r = await fetch('/api/me');
     if (r.ok) me = (await r.json()).user;
   } catch {}
-  if (!me) return location.replace('/login.html');
+  if (!me) {
+    // 未登录:带上邀请链接里的频道,登录/注册后自动跳回该频道
+    const c = new URLSearchParams(location.search).get('c');
+    return location.replace('/login.html' + (c ? `?c=${encodeURIComponent(c)}` : ''));
+  }
   state.myName = me.nickname;
   state.myUser = me.username;
   state.canShare = !!me.canShare;
@@ -83,9 +87,19 @@ async function bootstrapAuth() {
   applyShareUi();
   setDrawer(true); // 手机端初始展开频道抽屉
   await loadGuild();
+  maybeAutoJoin(); // 邀请链接 ?c=<频道id>:自动进入该频道
   loadPresence();
   setInterval(loadPresence, 10_000); // 频道人数轮询
   startStatsLoop();
+}
+
+// 邀请链接自动进频道:找到对应频道并进入(有密码会照常弹框),随后清掉 URL 参数
+function maybeAutoJoin() {
+  const c = new URLSearchParams(location.search).get('c');
+  if (!c || !state.guild) return;
+  history.replaceState(null, '', '/');
+  const ch = state.guild.channels.find((x) => x.id === c);
+  if (ch && ch.type !== 'text') tryJoinChannel(ch);
 }
 
 // 拉各频道当前人数;自己所在频道用本地实时数(state.peers),其余用轮询结果
@@ -786,6 +800,20 @@ async function attachCameraTo(peer) {
 // ---------- 麦克风 / 离开 ----------
 
 $('leaveBtn').addEventListener('click', () => leaveChannel());
+
+// 复制当前频道邀请链接:朋友打开后登录/注册即自动进本频道
+$('inviteBtn').addEventListener('click', async () => {
+  if (!state.channelId) return;
+  const url = `${location.origin}/?c=${encodeURIComponent(state.channelId)}`;
+  const span = $('inviteBtn').querySelector('span');
+  try {
+    await navigator.clipboard.writeText(url);
+    span.textContent = '已复制 ✓';
+    setTimeout(() => (span.textContent = '邀请'), 1500);
+  } catch {
+    prompt('复制此频道链接发给朋友:', url);
+  }
+});
 
 // ---------- 成员与画面渲染 ----------
 
