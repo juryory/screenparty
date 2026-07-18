@@ -527,3 +527,18 @@ select.field-input { cursor: pointer; }
 .role-tag { font-size: 12px; color: var(--text-dim); }
 .role-owner { color: var(--amber); }
 .role-sel { padding: 5px 8px; font-size: 13px; }
+
+/* 断线重连提示条 */
+.net-status {
+  position: fixed;
+  top: 12px; left: 50%;
+  transform: translateX(-50%);
+  z-index: 300;
+  background: var(--tally);
+  color: #fff;
+  font-size: 13px;
+  font-weight: 600;
+  padding: 7px 16px;
+  border-radius: 20px;
+  box-shadow: 0 6px 20px rgba(0, 0, 0, 0.45);
+}

@@ -723,6 +723,32 @@ export class Guild extends DurableObject {
 export class Room {
   constructor(state) {
     this.state = state;
+    // 心跳:客户端每 ~10s 发 {type:'ping'},在 webSocketMessage 里刷新该连接的 lastSeen;
+    // 定时 alarm 找出很久没 ping 的连接 = 已掉线(突然断网不会发关闭帧),清掉并广播离开。
+  }
+
+  // 首次有人连入时起定时器;之后每次 alarm 里按需续期
+  async ensureAlarm() {
+    if ((await this.state.storage.getAlarm()) == null) {
+      await this.state.storage.setAlarm(Date.now() + 10000);
+    }
+  }
+
+  // 定时清理:超过 35s(约 3 个心跳)没 ping 的连接判为掉线,广播其离开并关闭
+  async alarm() {
+    const now = Date.now();
+    const STALE_MS = 25000;
+    for (const ws of this.state.getWebSockets()) {
+      const a = ws.deserializeAttachment() || {};
+      const last = Math.max(a.lastSeen || 0, a.joinedAt || 0);
+      if (now - last > STALE_MS) {
+        if (a.id) this.broadcast({ type: 'peer-left', id: a.id }, ws);
+        try {
+          ws.close(1001, 'timeout');
+        } catch {}
+      }
+    }
+    if (this.state.getWebSockets().length) await this.state.storage.setAlarm(now + 10000);
   }
 
   async fetch(request) {
@@ -741,7 +767,8 @@ export class Room {
     const pair = new WebSocketPair();
     // Hibernation API:空闲时 DO 休眠,不消耗运行时配额
     this.state.acceptWebSocket(pair[1]);
-    pair[1].serializeAttachment({ nick, user, canShare });
+    pair[1].serializeAttachment({ nick, user, canShare, joinedAt: Date.now() });
+    await this.ensureAlarm();
     return new Response(null, { status: 101, webSocket: pair[0] });
   }
 
@@ -754,6 +781,16 @@ export class Room {
     }
 
     switch (msg.type) {
+      case 'ping': {
+        // 心跳:刷新存活时间戳(掉线检测靠它)
+        const me = ws.deserializeAttachment();
+        if (me) {
+          me.lastSeen = Date.now();
+          ws.serializeAttachment(me);
+        }
+        break;
+      }
+
       case 'join': {
         const att = ws.deserializeAttachment() || {};
         const id = crypto.randomUUID().slice(0, 8);
@@ -774,7 +811,7 @@ export class Room {
           }
         }
 
-        ws.serializeAttachment({ id, name, user: att.user, canShare: !!att.canShare, sharing: false, camera: false });
+        ws.serializeAttachment({ id, name, user: att.user, canShare: !!att.canShare, sharing: false, camera: false, joinedAt: att.joinedAt || Date.now(), lastSeen: Date.now() });
 
         // 告知新人:自己的 id + 房间里已有哪些人(新人将向他们逐一发起连接)
         const others = this.roster().filter((p) => p.id !== id && !kicked.has(p.id));

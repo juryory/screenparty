@@ -280,6 +280,9 @@ async function joinChannel(id, name, topic) {
 }
 
 function leaveChannel(rerender = true) {
+  stopHeartbeat();
+  clearTimeout(reconnectTimer);
+  $('netStatus').hidden = true;
   if (state.screenStream) {
     state.screenStream.getTracks().forEach((t) => t.stop());
     state.screenStream = null;
@@ -416,7 +419,10 @@ function connectSignaling() {
   );
   state.ws = ws;
 
-  ws.onopen = () => ws.send(JSON.stringify({ type: 'join', name: state.myName }));
+  ws.onopen = () => {
+    ws.send(JSON.stringify({ type: 'join', name: state.myName }));
+    startHeartbeat(ws);
+  };
 
   ws.onmessage = async (e) => {
     if (state.ws !== ws) return; // 快速切频道时旧连接的迟到消息,直接丢弃
@@ -424,11 +430,17 @@ function connectSignaling() {
     switch (msg.type) {
       case 'welcome':
         state.myId = msg.id;
+        reconnectDelay = 1000; // 重连成功,退避归位
+        $('netStatus').hidden = true;
         renderMembers();
         // 新人主动向每个已有成员发起连接
         for (const p of msg.peers) {
           addPeer(p);
           await makeOffer(p.id);
+        }
+        // 重连后服务端把我的共享状态重置了,重新广播一次当前状态
+        if (state.screenStream || state.camStream) {
+          ws.send(JSON.stringify({ type: 'state', sharing: !!state.screenStream, camera: !!state.camStream }));
         }
         break;
       case 'peer-joined':
@@ -456,16 +468,63 @@ function connectSignaling() {
 
   ws.onclose = (e) => {
     if (state.ws !== ws) return;
+    stopHeartbeat();
     // 同账号在别处进了频道,本连接被服务器顶掉:退出本地频道状态
-    // (其他断线不动:媒体是 P2P 的,信令断开不影响通话,由自愈逻辑处理)
     if (e.reason === 'replaced') return leaveChannel();
     // 从未收到 welcome 就被关 = 连接被拒(如密码已被管理员改掉):清缓存退出
     if (!state.myId && state.channelId) {
       delete state.channelPw[state.channelId];
       leaveChannel();
       alert('进入频道失败,密码可能已更改,请重试');
+      return;
     }
+    // 意外断线(网络波动 / 被服务器判超时):自动重连本频道
+    if (state.channelId) scheduleReconnect();
   };
+}
+
+// ---------- 心跳 / 断线重连 ----------
+
+let heartbeatTimer = null;
+function startHeartbeat(ws) {
+  stopHeartbeat();
+  heartbeatTimer = setInterval(() => {
+    if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: 'ping' }));
+  }, 8000);
+}
+function stopHeartbeat() {
+  clearInterval(heartbeatTimer);
+  heartbeatTimer = null;
+}
+
+let reconnectTimer = null;
+let reconnectDelay = 1000;
+// 断线重连:清掉旧 peer(网络恢复后重新握手),退避重试进入本频道
+function scheduleReconnect() {
+  if (!state.channelId) return;
+  $('netStatus').hidden = false;
+  resetPeers();
+  clearTimeout(reconnectTimer);
+  reconnectTimer = setTimeout(() => {
+    if (!state.channelId) return;
+    reconnectDelay = Math.min(reconnectDelay * 2, 8000);
+    connectSignaling();
+  }, reconnectDelay);
+}
+
+// 清掉当前所有 peer(重连前),保留本地频道 / 共享状态
+function resetPeers() {
+  for (const [, p] of state.peers) {
+    clearTimeout(p.recoverTimer);
+    p.pc?.close();
+    p.audioEl && (p.audioEl.srcObject = null);
+    p.tile?.remove();
+    p.camTile?.remove();
+  }
+  state.peers.clear();
+  state.myId = null;
+  state.focusedId = null;
+  refreshTiles();
 }
 
 function sendSignal(to, data) {
