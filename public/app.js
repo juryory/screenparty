@@ -787,7 +787,8 @@ async function attachScreenTo(peer) {
 // mesh 里每对成员是独立 PeerConnection、独立编码器,所以能对不同人发不同码率。
 function applySendQuality(peer) {
   if (!peer.senders?.video || !state.screenStream) return;
-  const q = peer.sendQuality; // 'high' 主窗口 / 'mid' 游客 / 'low' 缩略图
+  // 游客共享也封顶 720p/1Mbps:主窗口请求 high 也降到 mid,不占用已注册观看者的下行/中继
+  const q = state.isGuest && peer.sendQuality === 'high' ? 'mid' : peer.sendQuality;
   const p = peer.senders.video.getParameters();
   if (!p.encodings?.length) p.encodings = [{}];
   if (q === 'high') {

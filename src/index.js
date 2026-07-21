@@ -472,7 +472,8 @@ export class Auth extends DurableObject {
       Date.now() + GUEST_TTL_MS,
       nickname,
     );
-    return { token, user: { username, nickname, isAdmin: false, enabled: true, canShare: false, isGuest: true } };
+    // 游客可共享(消耗自己上行);观看与共享都由前端锁在 720p/1Mbps,不占用已注册用户带宽
+    return { token, user: { username, nickname, isAdmin: false, enabled: true, canShare: true, isGuest: true } };
   }
 
   // 校验会话:过期/停用/被删的账号一律返回 null(即时失效)
@@ -482,8 +483,8 @@ export class Auth extends DurableObject {
     const s = this.sql.exec('SELECT username, guest_nick FROM sessions WHERE token = ?', token).toArray()[0];
     if (!s) return null;
     if (s.guest_nick) {
-      // 游客:无 users 行,直接返回游客身份(只能观看)
-      return { username: s.username, nickname: s.guest_nick, isAdmin: false, enabled: true, canShare: false, isGuest: true };
+      // 游客:无 users 行,直接返回游客身份(可共享,但前端锁 720p/1Mbps)
+      return { username: s.username, nickname: s.guest_nick, isAdmin: false, enabled: true, canShare: true, isGuest: true };
     }
     const user = this.sql.exec('SELECT * FROM users WHERE username = ?', s.username).toArray()[0];
     if (!user || !user.enabled) return null;
