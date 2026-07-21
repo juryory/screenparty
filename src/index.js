@@ -82,7 +82,7 @@ function publicUser(row) {
     nickname: row.nickname,
     isAdmin: !!row.is_admin,
     enabled: !!row.enabled,
-    canShare: !!row.can_share || !!row.is_admin,
+    canShare: true, // 所有注册用户都能共享(已取消后台开关);游客单独处理为只读
     isGuest: false,
     createdAt: row.created_at,
   };
@@ -472,8 +472,8 @@ export class Auth extends DurableObject {
       Date.now() + GUEST_TTL_MS,
       nickname,
     );
-    // 游客可共享(消耗自己上行);观看与共享都由前端锁在 720p/1Mbps,不占用已注册用户带宽
-    return { token, user: { username, nickname, isAdmin: false, enabled: true, canShare: true, isGuest: true } };
+    // 游客只读:不能共享(canShare=false),观看画质由前端锁到游客档(720p/可配码率)
+    return { token, user: { username, nickname, isAdmin: false, enabled: true, canShare: false, isGuest: true } };
   }
 
   // 校验会话:过期/停用/被删的账号一律返回 null(即时失效)
@@ -483,8 +483,8 @@ export class Auth extends DurableObject {
     const s = this.sql.exec('SELECT username, guest_nick FROM sessions WHERE token = ?', token).toArray()[0];
     if (!s) return null;
     if (s.guest_nick) {
-      // 游客:无 users 行,直接返回游客身份(可共享,但前端锁 720p/1Mbps)
-      return { username: s.username, nickname: s.guest_nick, isAdmin: false, enabled: true, canShare: true, isGuest: true };
+      // 游客:无 users 行,直接返回游客身份(只读,不能共享)
+      return { username: s.username, nickname: s.guest_nick, isAdmin: false, enabled: true, canShare: false, isGuest: true };
     }
     const user = this.sql.exec('SELECT * FROM users WHERE username = ?', s.username).toArray()[0];
     if (!user || !user.enabled) return null;
@@ -579,8 +579,17 @@ export class Guild extends DurableObject {
         id INTEGER PRIMARY KEY CHECK (id = 1),
         name TEXT NOT NULL,
         icon TEXT NOT NULL DEFAULT '🎮',
-        description TEXT NOT NULL DEFAULT ''
+        description TEXT NOT NULL DEFAULT '',
+        clear_kbps  INTEGER NOT NULL DEFAULT 2500,
+        smooth_kbps INTEGER NOT NULL DEFAULT 1500,
+        guest_kbps  INTEGER NOT NULL DEFAULT 800
       )`);
+      // 迁移:旧库补画质档码率列(新库建表已含,ALTER 抛错跳过)
+      for (const col of ['clear_kbps INTEGER NOT NULL DEFAULT 2500', 'smooth_kbps INTEGER NOT NULL DEFAULT 1500', 'guest_kbps INTEGER NOT NULL DEFAULT 800']) {
+        try {
+          this.sql.exec(`ALTER TABLE guild ADD COLUMN ${col}`);
+        } catch {}
+      }
       this.sql.exec(`CREATE TABLE IF NOT EXISTS categories (
         id TEXT PRIMARY KEY,
         name TEXT NOT NULL,
@@ -637,9 +646,16 @@ export class Guild extends DurableObject {
   }
 
   tree() {
-    const guild =
-      this.sql.exec('SELECT name, icon, description FROM guild WHERE id = 1').toArray()[0] ||
+    const g =
+      this.sql.exec('SELECT name, icon, description, clear_kbps, smooth_kbps, guest_kbps FROM guild WHERE id = 1').toArray()[0] ||
       { name: 'ScreenParty', icon: '🎮', description: '' };
+    const guild = {
+      name: g.name,
+      icon: g.icon,
+      description: g.description,
+      // 共享画质档码率(kbps):高清固定 3500,清晰/流畅/游客 由管理员可配
+      quality: { clear: g.clear_kbps ?? 2500, smooth: g.smooth_kbps ?? 1500, guest: g.guest_kbps ?? 800 },
+    };
     const categories = this.sql.exec('SELECT id, name, position FROM categories ORDER BY position, name').toArray();
     const channels = this.sql
       .exec('SELECT id, category_id AS categoryId, name, type, topic, password, position FROM channels ORDER BY position, name')
@@ -659,7 +675,7 @@ export class Guild extends DurableObject {
     return String(pw) === ch.password;
   }
 
-  updateGuild({ name, icon, description } = {}) {
+  updateGuild({ name, icon, description, clearKbps, smoothKbps, guestKbps } = {}) {
     if (name !== undefined) {
       const n = String(name).trim().slice(0, 32);
       if (!n) return { ok: false, status: 400, error: '服务器名不能为空' };
@@ -667,6 +683,11 @@ export class Guild extends DurableObject {
     }
     if (icon !== undefined) this.sql.exec('UPDATE guild SET icon = ? WHERE id = 1', String(icon).slice(0, 8));
     if (description !== undefined) this.sql.exec('UPDATE guild SET description = ? WHERE id = 1', String(description).slice(0, 200));
+    // 画质档码率(kbps),范围 200–6000
+    const clampKbps = (v) => Math.max(200, Math.min(6000, Math.round(Number(v) || 0)));
+    if (clearKbps !== undefined) this.sql.exec('UPDATE guild SET clear_kbps = ? WHERE id = 1', clampKbps(clearKbps));
+    if (smoothKbps !== undefined) this.sql.exec('UPDATE guild SET smooth_kbps = ? WHERE id = 1', clampKbps(smoothKbps));
+    if (guestKbps !== undefined) this.sql.exec('UPDATE guild SET guest_kbps = ? WHERE id = 1', clampKbps(guestKbps));
     return { ok: true };
   }
 

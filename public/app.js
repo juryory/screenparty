@@ -15,8 +15,10 @@ const state = {
   myName: '',
   myUser: '',
   role: 'member',
-  canShare: false, // 共享屏幕/摄像头权限(管理员后台开启)
-  isGuest: false,  // 游客:只能观看,画质压到 720p/1Mbps
+  canShare: false, // 能否共享屏幕/摄像头(注册用户皆可;游客只读)
+  isGuest: false,  // 游客:只能观看,画质锁到游客档(720p)
+  quality: { clear: 2500, smooth: 1500, guest: 800 }, // 画质档码率 kbps(从 /api/guild 加载)
+  shareTier: (() => { try { return localStorage.getItem('sp-tier') || 'smooth'; } catch { return 'smooth'; } })(), // 我的共享清晰度:hd/clear/smooth,默认流畅
   channelId: null,
   channelName: '',
   guild: null, // { guild:{name,icon,description}, categories:[], channels:[], me:{role} }
@@ -36,8 +38,7 @@ const SCREEN_MAX_BITRATE = 3_500_000; // ~3.5 Mbps,主窗口(被人放大观看)
 const THUMB_MAX_BITRATE = 300_000;    // 缩略图(没在主窗口看的共享)只发 ~300kbps
 const THUMB_SCALE = 3;                // 且分辨率降到 1/3,低码率下更耐看
 const CAM_MAX_BITRATE = 1_000_000;    // 摄像头固定 ~1 Mbps(人脸画面不需要屏幕那么高)
-const GUEST_MAX_BITRATE = 1_000_000;  // 游客观看上限 ~1 Mbps
-const GUEST_SCALE = 1.5;              // 且分辨率降到 720p(从 1080p / 1.5)
+const SD_SCALE = 1.5;                 // 720p 分辨率(从 1080p / 1.5),流畅档与游客档共用
 
 // ---------- Safari 自动播放兜底 ----------
 // Safari 拦截带声 autoplay(play() 拒绝后连画面都不解码,表现为黑屏)。
@@ -126,13 +127,20 @@ function channelCount(id) {
 // 共享按钮可用性:无权限禁用并提示(服务端同样会拦截,这里只是界面反馈);
 // 摄像头按钮常驻左下角,还需进了频道才可用
 function applyShareUi() {
-  const noPerm = '共享权限未开启,请联系管理员在用户管理中开启';
+  const noPerm = '游客只能观看,注册账号后即可共享';
   $('shareBtn').disabled = !state.canShare;
   $('shareBtn').title = state.canShare ? '' : noPerm;
   const cam = $('camBtn');
   cam.disabled = !state.canShare || !state.channelId;
   cam.title = !state.canShare ? noPerm : !state.channelId ? '进入频道后可开启摄像头' : state.camStream ? '关闭摄像头' : '摄像头';
+  // 清晰度档选择器:游客(不能共享)隐藏
+  const sel = $('shareTier');
+  if (sel) {
+    sel.hidden = !state.canShare;
+    sel.value = state.shareTier;
+  }
 }
+$('shareTier').addEventListener('change', () => setShareTier($('shareTier').value));
 
 // 拉服务器结构(名称/图标/分类/频道/我的角色)并渲染频道列表
 async function loadGuild() {
@@ -144,6 +152,7 @@ async function loadGuild() {
     return;
   }
   state.role = state.guild.me?.role || 'member';
+  if (state.guild.guild.quality) state.quality = state.guild.guild.quality;
   $('guildName').textContent = state.guild.guild.name;
   $('serverBadge').textContent = state.guild.guild.icon || '🎮';
   $('serverBadge').title = state.guild.guild.name;
@@ -785,24 +794,41 @@ async function attachScreenTo(peer) {
 
 // 按对方请求的清晰度设置发给他的这一路:主窗口=全码率全分辨率,缩略图=低码率+降分辨率。
 // mesh 里每对成员是独立 PeerConnection、独立编码器,所以能对不同人发不同码率。
+// 我选的共享清晰度档对应的 {码率, 分辨率缩放}
+function shareTierParams() {
+  if (state.shareTier === 'hd') return { br: SCREEN_MAX_BITRATE, scale: 1 };        // 高清 1080p / 3.5M
+  if (state.shareTier === 'clear') return { br: state.quality.clear * 1000, scale: 1 }; // 清晰 1080p
+  return { br: state.quality.smooth * 1000, scale: SD_SCALE };                      // 流畅 720p(默认)
+}
+
 function applySendQuality(peer) {
   if (!peer.senders?.video || !state.screenStream) return;
-  // 游客共享也封顶 720p/1Mbps:主窗口请求 high 也降到 mid,不占用已注册观看者的下行/中继
-  const q = state.isGuest && peer.sendQuality === 'high' ? 'mid' : peer.sendQuality;
+  const q = peer.sendQuality; // 'high' 主窗口(按我的共享档)/ 'mid' 游客 / 'low' 缩略图
+  let br, scale;
+  if (q === 'low') {
+    br = THUMB_MAX_BITRATE;
+    scale = THUMB_SCALE;
+  } else if (q === 'mid') {
+    br = state.quality.guest * 1000; // 游客档:720p / 可配码率
+    scale = SD_SCALE;
+  } else {
+    const t = shareTierParams();
+    br = t.br;
+    scale = t.scale;
+  }
   const p = peer.senders.video.getParameters();
   if (!p.encodings?.length) p.encodings = [{}];
-  if (q === 'high') {
-    p.encodings[0].maxBitrate = SCREEN_MAX_BITRATE;
-    p.encodings[0].scaleResolutionDownBy = 1;
-  } else if (q === 'mid') {
-    p.encodings[0].maxBitrate = GUEST_MAX_BITRATE; // 游客:720p / 1Mbps
-    p.encodings[0].scaleResolutionDownBy = GUEST_SCALE;
-  } else {
-    p.encodings[0].maxBitrate = THUMB_MAX_BITRATE;
-    p.encodings[0].scaleResolutionDownBy = THUMB_SCALE;
-  }
+  p.encodings[0].maxBitrate = br;
+  p.encodings[0].scaleResolutionDownBy = scale;
   p.degradationPreference = 'maintain-framerate'; // 带宽不足时降分辨率保帧率
   peer.senders.video.setParameters(p).catch(() => {});
+}
+
+// 切换共享清晰度档(共享中则立即对所有观看者重设)
+function setShareTier(tier) {
+  state.shareTier = tier;
+  try { localStorage.setItem('sp-tier', tier); } catch {}
+  if (state.screenStream) for (const p of state.peers.values()) applySendQuality(p);
 }
 
 function stopShare() {
@@ -1326,18 +1352,52 @@ $('guildMenuBtn').addEventListener('click', (e) => {
 });
 
 // ---- 具体操作 ----
+function numInput(value) {
+  const i = document.createElement('input');
+  i.className = 'field-input';
+  i.type = 'number';
+  i.min = '200';
+  i.max = '6000';
+  i.step = '100';
+  i.value = value;
+  return i;
+}
+
 function openServerSettings() {
   const g = state.guild.guild;
+  const q = g.quality || { clear: 2500, smooth: 1500, guest: 800 };
   const name = textInput(g.name, '服务器名', 32);
   const icon = textInput(g.icon, '一个 emoji', 4);
   const desc = textInput(g.description, '描述(可选)', 200);
+  const clear = numInput(q.clear);
+  const smooth = numInput(q.smooth);
+  const guest = numInput(q.guest);
+  const note = document.createElement('p');
+  note.className = 'field-note';
+  note.textContent = '画质档码率(kbps)。高清档固定 3.5Mbps/1080p;以下三档可调:';
   const body = document.createElement('div');
-  body.append(field('服务器名', name), field('图标(emoji)', icon), field('描述', desc));
+  body.append(
+    field('服务器名', name),
+    field('图标(emoji)', icon),
+    field('描述', desc),
+    note,
+    field('清晰档 (1080p)', clear),
+    field('流畅档 (720p,默认)', smooth),
+    field('游客档 (720p,仅观看)', guest),
+  );
   openModal('服务器设置', body, async () => {
     if (!name.value.trim()) return false;
-    const r = await api('PATCH', '/api/guild', { name: name.value.trim(), icon: icon.value.trim(), description: desc.value.trim() });
+    const r = await api('PATCH', '/api/guild', {
+      name: name.value.trim(),
+      icon: icon.value.trim(),
+      description: desc.value.trim(),
+      clearKbps: +clear.value,
+      smoothKbps: +smooth.value,
+      guestKbps: +guest.value,
+    });
     if (!r.ok) return (alert(r.error || '保存失败'), false);
     await loadGuild();
+    if (state.screenStream) for (const p of state.peers.values()) applySendQuality(p); // 新码率立即生效
   }, '保存');
 }
 

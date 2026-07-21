@@ -26,7 +26,6 @@
         <label>显示昵称<input id="cNick" maxlength="24" placeholder="房间里显示的名字" autocomplete="off" required /></label>
         <label>初始密码<input id="cPass" type="password" maxlength="128" placeholder="至少 6 位" autocomplete="new-password" required /></label>
         <label class="admin-check"><input id="cEnabled" type="checkbox" checked /> 启用</label>
-        <label class="admin-check"><input id="cShare" type="checkbox" checked /> 允许共享屏幕/摄像头</label>
       </div>
       <button class="btn-primary" type="submit">创建用户</button>
       <p id="createMsg" class="admin-msg" hidden></p>
@@ -38,7 +37,7 @@
       <div class="admin-table-wrap">
         <table class="admin-table">
           <thead>
-            <tr><th>用户名</th><th>昵称</th><th>角色</th><th>状态</th><th>共享</th><th>操作</th></tr>
+            <tr><th>用户名</th><th>昵称</th><th>角色</th><th>状态</th><th>操作</th></tr>
           </thead>
           <tbody id="userRows"></tbody>
         </table>
