@@ -23,14 +23,14 @@ function go() {
 
 // 登录 / 注册模式切换
 let registering = false;
-$('modeToggle').addEventListener('click', (e) => {
-  e.preventDefault();
+$('modeToggle').addEventListener('click', () => {
   registering = !registering;
   $('nickLabel').hidden = $('loginNick').hidden = !registering;
   $('regHint').hidden = !registering;
+  $('guestNote').hidden = registering;
   $('brandSub').textContent = registering ? '注册新账号' : '请使用账号登录';
   $('loginBtn').textContent = registering ? '注册并进入' : '登录';
-  $('modeToggle').textContent = registering ? '已有账号?去登录' : '没有账号?注册一个';
+  $('modeToggle').textContent = registering ? '返回登录' : '注册新账号';
   showError('');
 });
 
@@ -66,9 +66,8 @@ async function doSubmit() {
   }
 }
 
-// 游客进入:创建临时游客会话(只能观看、720p),成功后走与登录相同的跳转
-$('guestBtn').addEventListener('click', async (e) => {
-  e.preventDefault();
+// 游客进入:创建临时游客会话(随机名字,可看可共享,画质受限),成功后走与登录相同的跳转
+$('guestBtn').addEventListener('click', async () => {
   showError('');
   try {
     const r = await fetch('/api/guest', { method: 'POST' });

@@ -35,10 +35,8 @@ const state = {
 const ROLE_LABEL = { owner: '所有者', admin: '管理员', member: '成员' };
 
 const SCREEN_MAX_BITRATE = 3_500_000; // ~3.5 Mbps,主窗口(被人放大观看)的全码率
-const THUMB_MAX_BITRATE = 300_000;    // 缩略图(没在主窗口看的共享)只发 ~300kbps
-const THUMB_SCALE = 3;                // 且分辨率降到 1/3,低码率下更耐看
+const THUMB_MAX_BITRATE = 300_000;    // 缩略图(没在主窗口看的共享)只发 ~300kbps,分辨率随之自动降
 const CAM_MAX_BITRATE = 1_000_000;    // 摄像头固定 ~1 Mbps(人脸画面不需要屏幕那么高)
-const SD_SCALE = 1.5;                 // 720p 分辨率(从 1080p / 1.5),流畅档与游客档共用
 
 // ---------- Safari 自动播放兜底 ----------
 // Safari 拦截带声 autoplay(play() 拒绝后连画面都不解码,表现为黑屏)。
@@ -89,6 +87,7 @@ async function bootstrapAuth() {
   $('uNick').textContent = me.nickname;
   $('uAvatar').textContent = me.nickname.slice(0, 2);
   $('adminLink').hidden = !me.isAdmin;
+  $('registerBtn').hidden = !me.isGuest; // 游客可就地注册升级为正式账号(即改名)
   applyShareUi();
   setDrawer(true); // 手机端初始展开频道抽屉
   await loadGuild();
@@ -133,10 +132,10 @@ function applyShareUi() {
   const cam = $('camBtn');
   cam.disabled = !state.canShare || !state.channelId;
   cam.title = !state.canShare ? noPerm : !state.channelId ? '进入频道后可开启摄像头' : state.camStream ? '关闭摄像头' : '摄像头';
-  // 清晰度档选择器:游客(不能共享)隐藏
+  // 清晰度档选择器:游客隐藏(游客档位锁定,不可自选)
   const sel = $('shareTier');
   if (sel) {
-    sel.hidden = !state.canShare;
+    sel.hidden = !state.canShare || state.isGuest;
     sel.value = state.shareTier;
   }
 }
@@ -186,6 +185,48 @@ $('logoutBtn').addEventListener('click', async () => {
     await fetch('/api/logout', { method: 'POST' });
   } catch {}
   location.replace('/login.html');
+});
+
+// 游客就地注册:输入用户名/昵称/密码即注册为正式账号(也就是「改名」)。成功后刷新页面换上新身份。
+$('registerBtn').addEventListener('click', () => {
+  $('userMenu').hidden = true;
+  const wrap = document.createElement('div');
+  wrap.style.cssText = 'display:flex;flex-direction:column;gap:14px';
+  const uUser = textInput('', '字母/数字/下划线', 32);
+  const uNick = textInput(state.isGuest ? '' : state.myName, '频道里显示的名字', 24);
+  const uPass = textInput('', '至少 6 位', 128);
+  uPass.type = 'password';
+  const err = document.createElement('p');
+  err.className = 'lobby-error';
+  err.hidden = true;
+  wrap.append(
+    field('用户名', uUser),
+    field('显示昵称', uNick),
+    field('密码', uPass),
+    err,
+  );
+  openModal('注册账号', wrap, async () => {
+    const username = uUser.value.trim();
+    const nickname = uNick.value.trim();
+    const password = uPass.value;
+    const fail = (t) => { err.textContent = t; err.hidden = false; return false; };
+    if (!username || !password) return fail('请输入用户名和密码');
+    if (!nickname) return fail('请填写显示昵称');
+    if (password.length < 6) return fail('密码至少 6 位');
+    try {
+      const r = await fetch('/api/register', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ username, nickname, password }),
+      });
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok) return fail(j.error || '注册失败'); // 用户名/昵称重复等会在此提示
+      location.reload(); // 换上正式账号身份重新进入
+      return true;
+    } catch {
+      return fail('网络错误,请重试');
+    }
+  }, '注册并使用');
 });
 
 // ---------- 频道列表 ----------
@@ -794,32 +835,29 @@ async function attachScreenTo(peer) {
 
 // 按对方请求的清晰度设置发给他的这一路:主窗口=全码率全分辨率,缩略图=低码率+降分辨率。
 // mesh 里每对成员是独立 PeerConnection、独立编码器,所以能对不同人发不同码率。
-// 我选的共享清晰度档对应的 {码率, 分辨率缩放}
-function shareTierParams() {
-  if (state.shareTier === 'hd') return { br: SCREEN_MAX_BITRATE, scale: 1 };        // 高清 1080p / 3.5M
-  if (state.shareTier === 'clear') return { br: state.quality.clear * 1000, scale: 1 }; // 清晰 1080p
-  return { br: state.quality.smooth * 1000, scale: SD_SCALE };                      // 流畅 720p(默认)
+// 档位只定「码率上限」,分辨率交给编码器自适应(码率不够时按 maintain-framerate 自动降清晰度)。
+// 我作为共享者、发给「主窗口观看者」时用的码率上限(kbps):
+function myShareKbps() {
+  if (state.isGuest) return state.quality.guest;   // 游客共享:锁在游客档
+  if (state.shareTier === 'hd') return SCREEN_MAX_BITRATE / 1000; // 高清 3.5M
+  if (state.shareTier === 'clear') return state.quality.clear;    // 清晰(管理员可配)
+  return state.quality.smooth;                                    // 流畅(默认,管理员可配)
+}
+
+// 针对某个观看者算出码率上限(kbps):low=缩略图 / mid=游客观看 / high=主窗口
+function peerSendKbps(peer) {
+  const q = peer.sendQuality;
+  if (q === 'low') return THUMB_MAX_BITRATE / 1000; // 缩略图:极低码率,编码器自动降到很小的分辨率
+  if (q === 'mid') return state.quality.guest;      // 观看者是游客:锁游客档
+  return myShareKbps();                             // 主窗口:按我的共享档(游客则锁游客档)
 }
 
 function applySendQuality(peer) {
   if (!peer.senders?.video || !state.screenStream) return;
-  const q = peer.sendQuality; // 'high' 主窗口(按我的共享档)/ 'mid' 游客 / 'low' 缩略图
-  let br, scale;
-  if (q === 'low') {
-    br = THUMB_MAX_BITRATE;
-    scale = THUMB_SCALE;
-  } else if (q === 'mid') {
-    br = state.quality.guest * 1000; // 游客档:720p / 可配码率
-    scale = SD_SCALE;
-  } else {
-    const t = shareTierParams();
-    br = t.br;
-    scale = t.scale;
-  }
   const p = peer.senders.video.getParameters();
   if (!p.encodings?.length) p.encodings = [{}];
-  p.encodings[0].maxBitrate = br;
-  p.encodings[0].scaleResolutionDownBy = scale;
+  p.encodings[0].maxBitrate = Math.round(peerSendKbps(peer) * 1000);
+  p.encodings[0].scaleResolutionDownBy = 1; // 分辨率自动:不强制缩放,由码率上限 + 编码器自适应决定
   p.degradationPreference = 'maintain-framerate'; // 带宽不足时降分辨率保帧率
   peer.senders.video.setParameters(p).catch(() => {});
 }
@@ -1374,16 +1412,16 @@ function openServerSettings() {
   const guest = numInput(q.guest);
   const note = document.createElement('p');
   note.className = 'field-note';
-  note.textContent = '画质档码率(kbps)。高清档固定 3.5Mbps/1080p;以下三档可调:';
+  note.textContent = '各档「码率上限(kbps)」,分辨率由编码器按码率自动决定。高清档固定 3.5Mbps;以下三档可调:';
   const body = document.createElement('div');
   body.append(
     field('服务器名', name),
     field('图标(emoji)', icon),
     field('描述', desc),
     note,
-    field('清晰档 (1080p)', clear),
-    field('流畅档 (720p,默认)', smooth),
-    field('游客档 (720p,仅观看)', guest),
+    field('清晰档', clear),
+    field('流畅档(默认)', smooth),
+    field('游客档(游客共享/观看)', guest),
   );
   openModal('服务器设置', body, async () => {
     if (!name.value.trim()) return false;

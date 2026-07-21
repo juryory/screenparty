@@ -24,9 +24,12 @@
     <input id="loginPass" type="password" maxlength="128" placeholder="密码" autocomplete="current-password" />
     <button id="loginBtn" class="btn-primary">登录</button>
     <p id="loginError" class="lobby-error" hidden></p>
-    <p class="lobby-hint"><a href="#" id="modeToggle">没有账号?注册一个</a></p>
-    <p class="lobby-hint" id="regHint" hidden>新账号默认没有共享屏幕/摄像头的权限,需管理员开启后才能共享。</p>
-    <div class="login-guest"><a href="#" id="guestBtn">以游客身份进入</a>（仅观看,画质 720p）</div>
+    <p class="lobby-hint" id="regHint" hidden>注册后即可共享屏幕、开麦、开摄像头,画质不受限。</p>
+    <div class="lobby-actions">
+      <button id="modeToggle" class="btn-secondary" type="button">注册新账号</button>
+      <button id="guestBtn" class="btn-ghost" type="button">游客进入</button>
+    </div>
+    <p class="lobby-note" id="guestNote">游客免注册,可看可共享,仅画质受限;进入后可随时注册升级为正式账号。</p>
   </div>
 </section>
 

@@ -472,8 +472,8 @@ export class Auth extends DurableObject {
       Date.now() + GUEST_TTL_MS,
       nickname,
     );
-    // 游客只读:不能共享(canShare=false),观看画质由前端锁到游客档(720p/可配码率)
-    return { token, user: { username, nickname, isAdmin: false, enabled: true, canShare: false, isGuest: true } };
+    // 游客可看可共享,但画质(收/发)都由前端锁在游客档(码率上限,分辨率自动)
+    return { token, user: { username, nickname, isAdmin: false, enabled: true, canShare: true, isGuest: true } };
   }
 
   // 校验会话:过期/停用/被删的账号一律返回 null(即时失效)
@@ -483,8 +483,8 @@ export class Auth extends DurableObject {
     const s = this.sql.exec('SELECT username, guest_nick FROM sessions WHERE token = ?', token).toArray()[0];
     if (!s) return null;
     if (s.guest_nick) {
-      // 游客:无 users 行,直接返回游客身份(只读,不能共享)
-      return { username: s.username, nickname: s.guest_nick, isAdmin: false, enabled: true, canShare: false, isGuest: true };
+      // 游客:无 users 行,可看可共享,但收/发画质由前端锁在游客档(码率上限,分辨率自动)
+      return { username: s.username, nickname: s.guest_nick, isAdmin: false, enabled: true, canShare: true, isGuest: true };
     }
     const user = this.sql.exec('SELECT * FROM users WHERE username = ?', s.username).toArray()[0];
     if (!user || !user.enabled) return null;
@@ -513,7 +513,9 @@ export class Auth extends DurableObject {
     if (!nickname) return { ok: false, status: 400, error: '请填写显示昵称' };
     if (password.length < 6) return { ok: false, status: 400, error: '密码至少 6 位' };
     const dup = this.sql.exec('SELECT username FROM users WHERE username = ?', username).toArray();
-    if (dup.length) return { ok: false, status: 409, error: '用户名已存在' };
+    if (dup.length) return { ok: false, status: 409, error: '用户名已被占用,换一个' };
+    const dupNick = this.sql.exec('SELECT username FROM users WHERE nickname = ?', nickname).toArray();
+    if (dupNick.length) return { ok: false, status: 409, error: '昵称已被占用,换一个' };
     const { salt, hash } = await hashPassword(password);
     this.sql.exec(
       'INSERT INTO users (username, nickname, pw_hash, pw_salt, is_admin, enabled, can_share, created_at) VALUES (?, ?, ?, ?, 0, ?, ?, ?)',
@@ -537,6 +539,8 @@ export class Auth extends DurableObject {
     if (nickname !== undefined) {
       const n = String(nickname).trim().slice(0, 24);
       if (!n) return { ok: false, status: 400, error: '昵称不能为空' };
+      const dupNick = this.sql.exec('SELECT username FROM users WHERE nickname = ? AND username != ?', n, username).toArray();
+      if (dupNick.length) return { ok: false, status: 409, error: '昵称已被占用,换一个' };
       this.sql.exec('UPDATE users SET nickname = ? WHERE username = ?', n, username);
     }
     if (password !== undefined && password !== '') {
