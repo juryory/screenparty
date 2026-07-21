@@ -542,3 +542,8 @@ select.field-input { cursor: pointer; }
   border-radius: 20px;
   box-shadow: 0 6px 20px rgba(0, 0, 0, 0.45);
 }
+
+/* 游客进入入口 */
+.login-guest { text-align: center; font-size: 12px; color: var(--text-dim); margin-top: 6px; }
+.login-guest a { color: var(--text); text-decoration: none; }
+.login-guest a:hover { text-decoration: underline; }

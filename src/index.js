@@ -12,6 +12,7 @@ const MAX_PEERS = 8;
 
 const SESSION_COOKIE = 'sp_session';
 const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 天
+const GUEST_TTL_MS = 12 * 60 * 60 * 1000; // 游客会话 12 小时
 
 // coturn REST API 临时凭证(use-auth-secret 模式):
 //   username   = 过期时间戳(unix 秒),coturn 会校验其未过期
@@ -82,6 +83,7 @@ function publicUser(row) {
     isAdmin: !!row.is_admin,
     enabled: !!row.enabled,
     canShare: !!row.can_share || !!row.is_admin,
+    isGuest: false,
     createdAt: row.created_at,
   };
 }
@@ -129,6 +131,12 @@ export default {
       const r = await auth.register(body);
       if (!r.ok) return Response.json({ error: r.error }, { status: r.status || 400 });
       const res = await auth.login(String(body.username || ''), String(body.password || ''));
+      return Response.json({ user: res.user }, { headers: { 'Set-Cookie': sessionCookie(res.token) } });
+    }
+
+    // 游客进入:创建临时游客会话(只能观看,无共享权限)
+    if (url.pathname === '/api/guest' && request.method === 'POST') {
+      const res = await auth.guestLogin();
       return Response.json({ user: res.user }, { headers: { 'Set-Cookie': sessionCookie(res.token) } });
     }
 
@@ -403,8 +411,13 @@ export class Auth extends DurableObject {
       this.sql.exec(`CREATE TABLE IF NOT EXISTS sessions (
         token      TEXT PRIMARY KEY,
         username   TEXT NOT NULL,
-        expires_at INTEGER NOT NULL
+        expires_at INTEGER NOT NULL,
+        guest_nick TEXT
       )`);
+      // 迁移:旧库补 guest_nick 列(游客会话用,无对应 users 行)
+      try {
+        this.sql.exec('ALTER TABLE sessions ADD COLUMN guest_nick TEXT');
+      } catch {}
       await this.seedAdmin();
     });
   }
@@ -447,12 +460,31 @@ export class Auth extends DurableObject {
     this.sql.exec('DELETE FROM sessions WHERE token = ?', token);
   }
 
+  // 游客会话:不建账号,只在 sessions 表放一条带 guest_nick 的记录;只能观看,无共享权限
+  async guestLogin() {
+    const username = 'guest:' + crypto.randomUUID().slice(0, 8);
+    const nickname = '游客' + Math.floor(1000 + Math.random() * 9000);
+    const token = crypto.randomUUID() + crypto.randomUUID().replace(/-/g, '');
+    this.sql.exec(
+      'INSERT INTO sessions (token, username, expires_at, guest_nick) VALUES (?, ?, ?, ?)',
+      token,
+      username,
+      Date.now() + GUEST_TTL_MS,
+      nickname,
+    );
+    return { token, user: { username, nickname, isAdmin: false, enabled: true, canShare: false, isGuest: true } };
+  }
+
   // 校验会话:过期/停用/被删的账号一律返回 null(即时失效)
   async verify(token) {
     if (!token) return null;
     this.sql.exec('DELETE FROM sessions WHERE expires_at < ?', Date.now());
-    const s = this.sql.exec('SELECT username FROM sessions WHERE token = ?', token).toArray()[0];
+    const s = this.sql.exec('SELECT username, guest_nick FROM sessions WHERE token = ?', token).toArray()[0];
     if (!s) return null;
+    if (s.guest_nick) {
+      // 游客:无 users 行,直接返回游客身份(只能观看)
+      return { username: s.username, nickname: s.guest_nick, isAdmin: false, enabled: true, canShare: false, isGuest: true };
+    }
     const user = this.sql.exec('SELECT * FROM users WHERE username = ?', s.username).toArray()[0];
     if (!user || !user.enabled) return null;
     return publicUser(user);

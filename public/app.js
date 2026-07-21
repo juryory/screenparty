@@ -16,6 +16,7 @@ const state = {
   myUser: '',
   role: 'member',
   canShare: false, // 共享屏幕/摄像头权限(管理员后台开启)
+  isGuest: false,  // 游客:只能观看,画质压到 720p/1Mbps
   channelId: null,
   channelName: '',
   guild: null, // { guild:{name,icon,description}, categories:[], channels:[], me:{role} }
@@ -35,6 +36,8 @@ const SCREEN_MAX_BITRATE = 3_500_000; // ~3.5 Mbps,主窗口(被人放大观看)
 const THUMB_MAX_BITRATE = 300_000;    // 缩略图(没在主窗口看的共享)只发 ~300kbps
 const THUMB_SCALE = 3;                // 且分辨率降到 1/3,低码率下更耐看
 const CAM_MAX_BITRATE = 1_000_000;    // 摄像头固定 ~1 Mbps(人脸画面不需要屏幕那么高)
+const GUEST_MAX_BITRATE = 1_000_000;  // 游客观看上限 ~1 Mbps
+const GUEST_SCALE = 1.5;              // 且分辨率降到 720p(从 1080p / 1.5)
 
 // ---------- Safari 自动播放兜底 ----------
 // Safari 拦截带声 autoplay(play() 拒绝后连画面都不解码,表现为黑屏)。
@@ -80,6 +83,7 @@ async function bootstrapAuth() {
   state.myName = me.nickname;
   state.myUser = me.username;
   state.canShare = !!me.canShare;
+  state.isGuest = !!me.isGuest;
   $('app').hidden = false;
   $('uNick').textContent = me.nickname;
   $('uAvatar').textContent = me.nickname.slice(0, 2);
@@ -143,7 +147,7 @@ async function loadGuild() {
   $('guildName').textContent = state.guild.guild.name;
   $('serverBadge').textContent = state.guild.guild.icon || '🎮';
   $('serverBadge').title = state.guild.guild.name;
-  $('uRole').textContent = ROLE_LABEL[state.role] || '成员';
+  $('uRole').textContent = state.isGuest ? '游客' : ROLE_LABEL[state.role] || '成员';
   $('guildMenuBtn').hidden = !canManage();
   renderChannels();
 }
@@ -695,9 +699,9 @@ async function handleSignal(from, data) {
   let peer = state.peers.get(from);
   if (!peer) return;
 
-  // 对方告诉我:把发给他的这一路调成高清(他放主窗口)还是缩略图
+  // 对方告诉我:把发给他的这一路调成高清(主窗口)/ 游客档 / 缩略图
   if (data.want) {
-    peer.sendQuality = data.want === 'high' ? 'high' : 'low';
+    peer.sendQuality = data.want === 'high' ? 'high' : data.want === 'mid' ? 'mid' : 'low';
     applySendQuality(peer);
     return;
   }
@@ -783,11 +787,19 @@ async function attachScreenTo(peer) {
 // mesh 里每对成员是独立 PeerConnection、独立编码器,所以能对不同人发不同码率。
 function applySendQuality(peer) {
   if (!peer.senders?.video || !state.screenStream) return;
-  const high = peer.sendQuality === 'high';
+  const q = peer.sendQuality; // 'high' 主窗口 / 'mid' 游客 / 'low' 缩略图
   const p = peer.senders.video.getParameters();
   if (!p.encodings?.length) p.encodings = [{}];
-  p.encodings[0].maxBitrate = high ? SCREEN_MAX_BITRATE : THUMB_MAX_BITRATE;
-  p.encodings[0].scaleResolutionDownBy = high ? 1 : THUMB_SCALE;
+  if (q === 'high') {
+    p.encodings[0].maxBitrate = SCREEN_MAX_BITRATE;
+    p.encodings[0].scaleResolutionDownBy = 1;
+  } else if (q === 'mid') {
+    p.encodings[0].maxBitrate = GUEST_MAX_BITRATE; // 游客:720p / 1Mbps
+    p.encodings[0].scaleResolutionDownBy = GUEST_SCALE;
+  } else {
+    p.encodings[0].maxBitrate = THUMB_MAX_BITRATE;
+    p.encodings[0].scaleResolutionDownBy = THUMB_SCALE;
+  }
   p.degradationPreference = 'maintain-framerate'; // 带宽不足时降分辨率保帧率
   peer.senders.video.setParameters(p).catch(() => {});
 }
@@ -1030,7 +1042,7 @@ function updateViewQuality() {
       p.viewReq = null;
       continue;
     }
-    const want = state.focusedId === id ? 'high' : 'low';
+    const want = state.focusedId === id ? (state.isGuest ? 'mid' : 'high') : 'low';
     if (p.viewReq !== want) {
       p.viewReq = want;
       sendSignal(id, { want });

@@ -66,6 +66,19 @@ async function doSubmit() {
   }
 }
 
+// 游客进入:创建临时游客会话(只能观看、720p),成功后走与登录相同的跳转
+$('guestBtn').addEventListener('click', async (e) => {
+  e.preventDefault();
+  showError('');
+  try {
+    const r = await fetch('/api/guest', { method: 'POST' });
+    if (r.ok) return go();
+    showError('游客进入失败,请重试');
+  } catch {
+    showError('网络错误,请重试');
+  }
+});
+
 function showError(text) {
   const el = $('loginError');
   el.textContent = text;
