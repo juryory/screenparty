@@ -852,13 +852,25 @@ function peerSendKbps(peer) {
   return myShareKbps();                             // 主窗口:按我的共享档(游客则锁游客档)
 }
 
+// 缩略图 / 游客观看这类低码率路:直接按目标高度缩放,不靠编码器自适应慢慢往下掉
+const THUMB_HEIGHT = 360;
+const GUEST_VIEW_HEIGHT = 720;
+
 function applySendQuality(peer) {
   if (!peer.senders?.video || !state.screenStream) return;
+  const srcH = state.screenStream.getVideoTracks()[0]?.getSettings().height || 1080;
+  const q = peer.sendQuality;
   const p = peer.senders.video.getParameters();
   if (!p.encodings?.length) p.encodings = [{}];
   p.encodings[0].maxBitrate = Math.round(peerSendKbps(peer) * 1000);
-  p.encodings[0].scaleResolutionDownBy = 1; // 分辨率自动:不强制缩放,由码率上限 + 编码器自适应决定
-  p.degradationPreference = 'maintain-framerate'; // 带宽不足时降分辨率保帧率
+  // 低码率路固定缩放;主窗口不缩放,保持采集分辨率
+  const targetH = q === 'low' ? THUMB_HEIGHT : q === 'mid' || state.isGuest ? GUEST_VIEW_HEIGHT : srcH;
+  p.encodings[0].scaleResolutionDownBy = Math.max(1, srcH / targetH);
+  // 带宽/CPU 吃紧时怎么退让:
+  //   高清/清晰 主窗口 → 保分辨率、掉帧率(maintain-framerate 会一路降到 1080→810→540→405,且回升很慢,画面糊)
+  //   流畅 / 缩略图 / 游客 → 保帧率、降分辨率
+  const keepRes = q !== 'low' && q !== 'mid' && !state.isGuest && (state.shareTier === 'hd' || state.shareTier === 'clear');
+  p.degradationPreference = keepRes ? 'maintain-resolution' : 'maintain-framerate';
   peer.senders.video.setParameters(p).catch(() => {});
 }
 
@@ -1214,9 +1226,10 @@ function startStatsLoop() {
         }
       } catch {}
     }
-    // 本地上行码率
+    // 本地上行码率:优先看发给主窗口观看者的那一路(缩略图路本来就是低分辨率,看它没意义)
     if (localTile && state.peers.size) {
-      const first = [...state.peers.values()].find((p) => p.senders?.video?.track);
+      const withVideo = [...state.peers.values()].filter((p) => p.senders?.video?.track);
+      const first = withVideo.find((p) => p.sendQuality !== 'low') || withVideo[0];
       if (first) {
         try {
           const stats = await first.pc.getStats(first.senders.video.track);
@@ -1225,9 +1238,14 @@ function startStatsLoop() {
               const prev = last.get('local') || 0;
               const kbps = Math.round(((s.bytesSent - prev) * 8) / 2000);
               last.set('local', s.bytesSent);
+              // 编码受限原因 + 编码器实现:排查"为什么自动降分辨率/画面糊"
+              const limit = { bandwidth: ' ·带宽受限', cpu: ' ·CPU受限', other: ' ·受限' }[s.qualityLimitationReason] || '';
+              // 只取括号里的具体实现名(如 "ExternalEncoder (MediaFoundation...)" → MediaFoundation...),避免挤爆角标
+              const encName = (s.encoderImplementation || '').replace(/^[^(]*\(|\)[^)]*$/g, '').slice(0, 24);
+              const enc = encName ? ` ${encName}` : '';
               localTile.querySelector('.tile-stats').textContent =
                 `↑ ${s.frameWidth || '?'}×${s.frameHeight || '?'} ` +
-                `${s.framesPerSecond || 0}fps ${kbps}kbps ×${state.peers.size}路`;
+                `${s.framesPerSecond || 0}fps ${kbps}kbps ×${state.peers.size}路${limit}${enc}`;
             }
           });
         } catch {}
