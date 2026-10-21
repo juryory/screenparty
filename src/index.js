@@ -1,7 +1,7 @@
 // ScreenParty — 信令服务 (Cloudflare Worker + Durable Object)
 // 媒体流走 WebRTC mesh 点对点传输,本服务只负责:
-//   1. 鉴权     账号登录 / 自助注册 / 会话 / 管理员用户管理(禁止匿名;
-//               新注册账号默认无共享屏幕/摄像头权限,由管理员开启)
+//   1. 鉴权     账号登录 / 自助注册 / 游客会话 / 管理员用户管理
+//               (目前所有登录者含游客都能共享;游客画质由前端锁在游客档)
 //   2. /ws/:room   房间信令 (join / signal 转发 / 成员状态广播)
 //   3. /api/turn   可选:签发 TURN 临时凭证(自建 coturn / Cloudflare Realtime)
 //   4. 其余路径    静态前端 (public/)
@@ -82,7 +82,7 @@ function publicUser(row) {
     nickname: row.nickname,
     isAdmin: !!row.is_admin,
     enabled: !!row.enabled,
-    canShare: true, // 所有注册用户都能共享(已取消后台开关);游客单独处理为只读
+    canShare: true, // 所有注册用户都能共享(已取消后台开关);信令层仍按此字段把关,便于日后恢复权限控制
     isGuest: false,
     createdAt: row.created_at,
   };
@@ -125,16 +125,19 @@ export default {
       return Response.json({ user: res.user }, { headers: { 'Set-Cookie': sessionCookie(res.token) } });
     }
 
-    // 自助注册:创建普通账号(无共享权限)并直接登录
+    // 自助注册:创建普通账号并直接登录
     if (url.pathname === '/api/register' && request.method === 'POST') {
       const body = await request.json().catch(() => ({}));
       const r = await auth.register(body);
       if (!r.ok) return Response.json({ error: r.error }, { status: r.status || 400 });
-      const res = await auth.login(String(body.username || ''), String(body.password || ''));
+      // 清掉同名旧账号可能残留的服务器角色,新账号一律从 member 起步
+      await env.GUILD.get(env.GUILD.idFromName('global')).removeMember(r.username);
+      // 用规范化(trim 后)的用户名登录,否则带空格的用户名会建号成功但登录失败
+      const res = await auth.login(r.username, String(body.password || ''));
       return Response.json({ user: res.user }, { headers: { 'Set-Cookie': sessionCookie(res.token) } });
     }
 
-    // 游客进入:创建临时游客会话(只能观看,无共享权限)
+    // 游客进入:创建临时游客会话(可看可共享,画质锁在游客档)
     if (url.pathname === '/api/guest' && request.method === 'POST') {
       const res = await auth.guestLogin();
       return Response.json({ user: res.user }, { headers: { 'Set-Cookie': sessionCookie(res.token) } });
@@ -171,7 +174,7 @@ export default {
       const user = await auth.verify(getCookie(request, SESSION_COOKIE));
       if (!user) return Response.json({ error: 'unauthorized' }, { status: 401 });
       if (!user.isAdmin) return Response.json({ error: 'forbidden' }, { status: 403 });
-      return this.adminUsers(request, url, auth);
+      return this.adminUsers(request, url, auth, env.GUILD.get(env.GUILD.idFromName('global')));
     }
 
     // WebSocket 信令:需有效会话,禁止匿名。校验后注入可信昵称,忽略客户端自报身份。
@@ -225,7 +228,7 @@ export default {
     return env.ASSETS.fetch(request);
   },
 
-  async adminUsers(request, url, auth) {
+  async adminUsers(request, url, auth, guild) {
     const method = request.method;
 
     if (url.pathname === '/api/admin/users') {
@@ -235,6 +238,7 @@ export default {
       if (method === 'POST') {
         const body = await request.json().catch(() => ({}));
         const r = await auth.createUser(body);
+        if (r.ok) await guild.removeMember(r.username); // 同注册:不继承同名旧账号的角色
         return Response.json(r.ok ? { ok: true } : { error: r.error }, {
           status: r.ok ? 200 : r.status || 400,
         });
@@ -252,6 +256,8 @@ export default {
     }
     if (method === 'DELETE') {
       const r = await auth.deleteUser(target);
+      // 同步删掉服务器角色,否则别人再注册同名账号会直接继承管理员身份
+      if (r.ok) await guild.removeMember(target);
       return Response.json(r.ok ? { ok: true } : { error: r.error }, {
         status: r.ok ? 200 : r.status || 400,
       });
@@ -460,7 +466,7 @@ export class Auth extends DurableObject {
     this.sql.exec('DELETE FROM sessions WHERE token = ?', token);
   }
 
-  // 游客会话:不建账号,只在 sessions 表放一条带 guest_nick 的记录;只能观看,无共享权限
+  // 游客会话:不建账号,只在 sessions 表放一条带 guest_nick 的记录
   async guestLogin() {
     const username = 'guest:' + crypto.randomUUID().slice(0, 8);
     const nickname = '游客' + Math.floor(1000 + Math.random() * 9000);
@@ -498,11 +504,12 @@ export class Auth extends DurableObject {
       .map(publicUser);
   }
 
-  // 自助注册:强制普通用户 + 无共享权限(需管理员后台开启)
+  // 自助注册:强制普通启用用户(共享权限目前对所有人放开,见 publicUser)
   async register({ username, nickname, password } = {}) {
     return this.createUser({ username, nickname, password, enabled: true, canShare: false });
   }
 
+  // 成功时返回规范化(trim 后)的用户名,调用方据此登录 / 清理角色
   async createUser({ username, nickname, password, enabled, canShare } = {}) {
     username = String(username || '').trim();
     nickname = String(nickname || '').trim().slice(0, 24);
@@ -527,7 +534,7 @@ export class Auth extends DurableObject {
       canShare ? 1 : 0,
       Date.now(),
     );
-    return { ok: true };
+    return { ok: true, username };
   }
 
   async updateUser(username, { nickname, password, enabled, canShare } = {}) {
@@ -774,6 +781,11 @@ export class Guild extends DurableObject {
     );
     return { ok: true };
   }
+
+  // 账号删除 / 同名新建时清掉其角色;所有者不动
+  removeMember(username) {
+    this.sql.exec("DELETE FROM members WHERE username = ? AND role != 'owner'", username);
+  }
 }
 
 // ---------- 房间信令:每个房间一个 Durable Object 实例 ----------
@@ -792,7 +804,7 @@ export class Room {
     }
   }
 
-  // 定时清理:超过 35s(约 3 个心跳)没 ping 的连接判为掉线,广播其离开并关闭
+  // 定时清理:超过 25s(约 3 个心跳)没 ping 的连接判为掉线,广播其离开并关闭
   async alarm() {
     const now = Date.now();
     const STALE_MS = 25000;

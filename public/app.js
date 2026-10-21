@@ -15,8 +15,8 @@ const state = {
   myName: '',
   myUser: '',
   role: 'member',
-  canShare: false, // 能否共享屏幕/摄像头(注册用户皆可;游客只读)
-  isGuest: false,  // 游客:只能观看,画质锁到游客档(720p)
+  canShare: false, // 能否共享屏幕/摄像头(目前所有登录者含游客皆可)
+  isGuest: false,  // 游客:收/发画质都锁到游客档码率
   quality: { clear: 2500, smooth: 1500, guest: 800 }, // 画质档码率 kbps(从 /api/guild 加载)
   shareTier: (() => { try { return localStorage.getItem('sp-tier') || 'smooth'; } catch { return 'smooth'; } })(), // 我的共享清晰度:hd/clear/smooth,默认流畅
   channelId: null,
