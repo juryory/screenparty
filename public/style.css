@@ -457,6 +457,8 @@ button:focus-visible, input:focus-visible { outline: 2px solid var(--amber); out
   .drawer-btn { display: flex; flex: 0 0 auto; }
   .userbar-text { display: flex; } /* 抽屉够宽,恢复昵称显示 */
   .ctl span { display: none; }     /* 顶栏按钮只留图标 */
+  .tradeoff-end { display: none; } /* 滑杆只留滑块 */
+  .tradeoff input { width: 64px; }
   .ch-topic { display: none; }
   .ch-name { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; min-width: 0; }
 
@@ -575,4 +577,13 @@ select.field-input { cursor: pointer; }
   padding: 7px 8px;
   cursor: pointer;
 }
+/* 质量-速度滑杆:越靠质量越保分辨率,越靠速度越保帧率 */
+.tradeoff {
+  display: flex; align-items: center; gap: 6px;
+  font-size: 12px;
+  color: var(--text-dim);
+  cursor: pointer;
+}
+.tradeoff[hidden] { display: none; }
+.tradeoff input { width: 84px; accent-color: var(--amber); cursor: pointer; }
 .field-note { font-size: 12px; color: var(--text-dim); margin: 2px 0 -4px; }

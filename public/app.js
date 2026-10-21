@@ -19,6 +19,8 @@ const state = {
   isGuest: false,  // 游客:收/发画质都锁到游客档码率
   quality: { clear: 2500, smooth: 1500, guest: 800 }, // 画质档码率 kbps(从 /api/guild 加载)
   shareTier: (() => { try { return localStorage.getItem('sp-tier') || 'smooth'; } catch { return 'smooth'; } })(), // 我的共享清晰度:hd/clear/smooth,默认流畅
+  // 质量-速度滑杆 0..4(0=最保画质,4=最保流畅),默认 1 = 画质优先
+  tradeoff: (() => { try { const v = Number(localStorage.getItem('sp-tradeoff') ?? 1); return v >= 0 && v <= 4 ? Math.round(v) : 1; } catch { return 1; } })(),
   channelId: null,
   channelName: '',
   guild: null, // { guild:{name,icon,description}, categories:[], channels:[], me:{role} }
@@ -37,6 +39,19 @@ const ROLE_LABEL = { owner: '所有者', admin: '管理员', member: '成员' };
 const SCREEN_MAX_BITRATE = 3_500_000; // ~3.5 Mbps,主窗口(被人放大观看)的全码率
 const THUMB_MAX_BITRATE = 300_000;    // 缩略图(没在主窗口看的共享)只发 ~300kbps,分辨率随之自动降
 const CAM_MAX_BITRATE = 1_000_000;    // 摄像头固定 ~1 Mbps(人脸画面不需要屏幕那么高)
+
+// 质量-速度滑杆各档:带宽/CPU 吃紧时编码器怎么退让(只作用于发给主窗口观看者的那一路)
+//   pref   degradationPreference:maintain-resolution 掉帧保分辨率 / balanced 两头都让 /
+//          maintain-framerate 降分辨率保帧率(会 1080→810→540→405 逐级掉,回升慢)
+//   fps    帧率上限:限帧后每帧分到的码率更多,画面更干净
+//   maxH   主动把分辨率压到这个高度以内,留出余量保流畅(null = 不限)
+const TRADEOFFS = [
+  { label: '极致画质', pref: 'maintain-resolution', fps: 20, maxH: null },
+  { label: '画质优先', pref: 'maintain-resolution', fps: 30, maxH: null },
+  { label: '平衡', pref: 'balanced', fps: 30, maxH: null },
+  { label: '流畅优先', pref: 'maintain-framerate', fps: 30, maxH: null },
+  { label: '极致流畅', pref: 'maintain-framerate', fps: 30, maxH: 720 },
+];
 
 // ---------- Safari 自动播放兜底 ----------
 // Safari 拦截带声 autoplay(play() 拒绝后连画面都不解码,表现为黑屏)。
@@ -138,8 +153,13 @@ function applyShareUi() {
     sel.hidden = !state.canShare || state.isGuest;
     sel.value = state.shareTier;
   }
+  // 质量-速度滑杆:同样游客隐藏(游客路固定保帧率)
+  $('tradeoffBox').hidden = !state.canShare || state.isGuest;
+  $('tradeoff').value = state.tradeoff;
+  $('tradeoffBox').title = `带宽/性能不够时的取舍:${TRADEOFFS[state.tradeoff].label}`;
 }
 $('shareTier').addEventListener('change', () => setShareTier($('shareTier').value));
+$('tradeoff').addEventListener('input', () => setTradeoff(Number($('tradeoff').value)));
 
 // 拉服务器结构(名称/图标/分类/频道/我的角色)并渲染频道列表
 async function loadGuild() {
@@ -856,22 +876,29 @@ function peerSendKbps(peer) {
 const THUMB_HEIGHT = 360;
 const GUEST_VIEW_HEIGHT = 720;
 
+
 function applySendQuality(peer) {
   if (!peer.senders?.video || !state.screenStream) return;
   const srcH = state.screenStream.getVideoTracks()[0]?.getSettings().height || 1080;
   const q = peer.sendQuality;
+  const lowPath = q === 'low' || q === 'mid' || state.isGuest; // 缩略图 / 游客:固定缩放 + 保帧率,不受滑杆影响
+  const t = TRADEOFFS[state.tradeoff] || TRADEOFFS[1];
   const p = peer.senders.video.getParameters();
   if (!p.encodings?.length) p.encodings = [{}];
   p.encodings[0].maxBitrate = Math.round(peerSendKbps(peer) * 1000);
-  // 低码率路固定缩放;主窗口不缩放,保持采集分辨率
-  const targetH = q === 'low' ? THUMB_HEIGHT : q === 'mid' || state.isGuest ? GUEST_VIEW_HEIGHT : srcH;
+  const targetH = q === 'low' ? THUMB_HEIGHT : lowPath ? GUEST_VIEW_HEIGHT : t.maxH || srcH;
   p.encodings[0].scaleResolutionDownBy = Math.max(1, srcH / targetH);
-  // 带宽/CPU 吃紧时怎么退让:
-  //   高清/清晰 主窗口 → 保分辨率、掉帧率(maintain-framerate 会一路降到 1080→810→540→405,且回升很慢,画面糊)
-  //   流畅 / 缩略图 / 游客 → 保帧率、降分辨率
-  const keepRes = q !== 'low' && q !== 'mid' && !state.isGuest && (state.shareTier === 'hd' || state.shareTier === 'clear');
-  p.degradationPreference = keepRes ? 'maintain-resolution' : 'maintain-framerate';
+  p.encodings[0].maxFramerate = lowPath ? 30 : t.fps;
+  p.degradationPreference = lowPath ? 'maintain-framerate' : t.pref;
   peer.senders.video.setParameters(p).catch(() => {});
+}
+
+// 拖动质量-速度滑杆(共享中则立即对所有观看者重设)
+function setTradeoff(v) {
+  state.tradeoff = v;
+  try { localStorage.setItem('sp-tradeoff', String(v)); } catch {}
+  $('tradeoffBox').title = `带宽/性能不够时的取舍:${TRADEOFFS[v].label}`;
+  if (state.screenStream) for (const p of state.peers.values()) applySendQuality(p);
 }
 
 // 切换共享清晰度档(共享中则立即对所有观看者重设)
