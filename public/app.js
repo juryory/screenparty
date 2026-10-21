@@ -108,7 +108,9 @@ async function bootstrapAuth() {
   await loadGuild();
   maybeAutoJoin(); // 邀请链接 ?c=<频道id>:自动进入该频道
   loadPresence();
-  setInterval(loadPresence, 10_000); // 频道人数轮询
+  // 频道人数轮询:页面在后台时不拉(省 DO 请求额度),切回前台立即补一次
+  setInterval(() => document.hidden || loadPresence(), 10_000);
+  document.addEventListener('visibilitychange', () => document.hidden || loadPresence());
   startStatsLoop();
 }
 

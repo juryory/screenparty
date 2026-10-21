@@ -18,6 +18,14 @@
       { "name": "GUILD", "class_name": "Guild" }
     ]
   },
+  // 限流(Workers Rate Limiting,按边缘节点近似计数,免费计划可用):
+  //   AUTH_LIMITER   登录 / 频道密码尝试:每 key 每分钟 10 次
+  //   SIGNUP_LIMITER 注册 / 游客进入:每 IP 每分钟 5 次
+  // 在 Worker 入口就拦掉,不让刷接口的请求打到单例 Auth DO 上跑 PBKDF2
+  "ratelimits": [
+    { "name": "AUTH_LIMITER", "namespace_id": "1001", "simple": { "limit": 10, "period": 60 } },
+    { "name": "SIGNUP_LIMITER", "namespace_id": "1002", "simple": { "limit": 5, "period": 60 } }
+  ],
   "migrations": [
     // SQLite-backed DO:Workers 免费计划即可使用
     { "tag": "v1", "new_sqlite_classes": ["Room"] },

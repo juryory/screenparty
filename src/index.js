@@ -108,6 +108,25 @@ function clearedCookie() {
   return `${SESSION_COOKIE}=; HttpOnly; Secure; SameSite=Lax; Path=/; Max-Age=0`;
 }
 
+// ---------- 限流 ----------
+
+// 超限返回 true。未配置 binding(老部署 / 测试环境)时放行,不影响可用性。
+async function overLimit(limiter, key) {
+  if (!limiter) return false;
+  try {
+    const { success } = await limiter.limit({ key });
+    return !success;
+  } catch {
+    return false;
+  }
+}
+function clientIp(request) {
+  return request.headers.get('CF-Connecting-IP') || 'unknown';
+}
+function tooMany() {
+  return Response.json({ error: '操作太频繁,请稍后再试' }, { status: 429 });
+}
+
 // ---------- Worker 入口 ----------
 
 export default {
@@ -118,6 +137,14 @@ export default {
     // 登录 / 登出 / 当前身份
     if (url.pathname === '/api/login' && request.method === 'POST') {
       const body = await request.json().catch(() => ({}));
+      // 同时按 IP 和用户名限:挡单 IP 撞库,也挡多 IP 轮换爆破同一账号
+      const uname = String(body.username || '').trim().toLowerCase();
+      if (
+        (await overLimit(env.AUTH_LIMITER, 'login-ip:' + clientIp(request))) ||
+        (uname && (await overLimit(env.AUTH_LIMITER, 'login-user:' + uname)))
+      ) {
+        return tooMany();
+      }
       const res = await auth.login(String(body.username || ''), String(body.password || ''));
       if (!res) {
         return Response.json({ error: '用户名或密码错误,或账号已停用' }, { status: 401 });
@@ -127,6 +154,7 @@ export default {
 
     // 自助注册:创建普通账号并直接登录
     if (url.pathname === '/api/register' && request.method === 'POST') {
+      if (await overLimit(env.SIGNUP_LIMITER, 'signup:' + clientIp(request))) return tooMany();
       const body = await request.json().catch(() => ({}));
       const r = await auth.register(body);
       if (!r.ok) return Response.json({ error: r.error }, { status: r.status || 400 });
@@ -139,6 +167,7 @@ export default {
 
     // 游客进入:创建临时游客会话(可看可共享,画质锁在游客档)
     if (url.pathname === '/api/guest' && request.method === 'POST') {
+      if (await overLimit(env.SIGNUP_LIMITER, 'signup:' + clientIp(request))) return tooMany();
       const res = await auth.guestLogin();
       return Response.json({ user: res.user }, { headers: { 'Set-Cookie': sessionCookie(res.token) } });
     }
@@ -166,7 +195,7 @@ export default {
       const user = await auth.verify(getCookie(request, SESSION_COOKIE));
       if (!user) return Response.json({ error: 'unauthorized' }, { status: 401 });
       const guild = env.GUILD.get(env.GUILD.idFromName('global'));
-      return this.guildApi(request, url, guild, auth, user);
+      return this.guildApi(request, url, guild, auth, user, env);
     }
 
     // 管理员:用户增删改查(需登录且 isAdmin)
@@ -188,34 +217,30 @@ export default {
 
       // 频道密码校验(owner/admin 免密):不通过直接拒绝升级,改前端也绕不过
       const guildDO = env.GUILD.get(env.GUILD.idFromName('global'));
-      const allowed = await guildDO.canEnter(wsMatch[1], user.username, url.searchParams.get('pw') || '');
+      const pw = url.searchParams.get('pw') || '';
+      // 带密码的升级也算一次密码尝试,和 /verify 共用额度,防止绕过 /verify 直接用 WS 爆破
+      if (pw && (await overLimit(env.AUTH_LIMITER, `chpw:${user.username}:${wsMatch[1]}`))) {
+        return new Response('too many attempts', { status: 429 });
+      }
+      const allowed = await guildDO.canEnter(wsMatch[1], user.username, pw);
       if (!allowed) return new Response('channel password required', { status: 403 });
 
       const headers = new Headers(request.headers);
       headers.set('X-SP-Nick', encodeURIComponent(user.nickname)); // 覆盖任何客户端伪造值
       headers.set('X-SP-User', user.username);
+      headers.set('X-SP-Room', wsMatch[1]); // Room 据此向 Guild 上报本频道人数
       headers.set('X-SP-Share', user.canShare ? '1' : '0'); // 共享权限,Room 据此拦截无权者的共享广播
       const id = env.ROOM.idFromName(wsMatch[1]);
       return env.ROOM.get(id).fetch(new Request(request, { headers }));
     }
 
-    // 各频道当前人数(频道列表显示「大厅 (5)」):逐个问询 Room DO
+    // 各频道当前人数(频道列表显示「大厅 (5)」):Room 有人进出时主动上报给 Guild,
+    // 这里只读 Guild 一次,不再逐个问询每个 Room DO(否则每次轮询 = 频道数 次 DO 请求)
     if (url.pathname === '/api/presence') {
       const user = await auth.verify(getCookie(request, SESSION_COOKIE));
       if (!user) return Response.json({ error: 'unauthorized' }, { status: 401 });
       const guild = env.GUILD.get(env.GUILD.idFromName('global'));
-      const { channels } = await guild.tree();
-      const entries = await Promise.all(
-        channels.map(async (ch) => {
-          try {
-            const r = await env.ROOM.get(env.ROOM.idFromName(ch.id)).fetch('https://room/count');
-            return [ch.id, (await r.json()).count || 0];
-          } catch {
-            return [ch.id, 0];
-          }
-        }),
-      );
-      return Response.json({ counts: Object.fromEntries(entries) });
+      return Response.json({ counts: await guild.presenceCounts() });
     }
 
     // TURN 临时凭证:同样需登录,杜绝匿名占用中继带宽
@@ -266,7 +291,7 @@ export default {
   },
 
   // 服务器结构 API:GET 树对所有登录者开放;增删改需 owner/admin;改角色需 owner
-  async guildApi(request, url, guild, auth, user) {
+  async guildApi(request, url, guild, auth, user, env) {
     const method = request.method;
     const role = await guild.roleOf(user.username);
     const canManage = role === 'owner' || role === 'admin';
@@ -303,6 +328,7 @@ export default {
     const verifyMatch = url.pathname.match(/^\/api\/channels\/([^/]+)\/verify$/);
     if (verifyMatch && method === 'POST') {
       const chId = decodeURIComponent(verifyMatch[1]);
+      if (await overLimit(env.AUTH_LIMITER, `chpw:${user.username}:${chId}`)) return tooMany();
       const ok = await guild.canEnter(chId, user.username, String((await body()).password || ''));
       return ok ? Response.json({ ok: true }) : Response.json({ error: '频道密码错误' }, { status: 403 });
     }
@@ -485,8 +511,15 @@ export class Auth extends DurableObject {
   // 校验会话:过期/停用/被删的账号一律返回 null(即时失效)
   async verify(token) {
     if (!token) return null;
-    this.sql.exec('DELETE FROM sessions WHERE expires_at < ?', Date.now());
-    const s = this.sql.exec('SELECT username, guest_nick FROM sessions WHERE token = ?', token).toArray()[0];
+    const now = Date.now();
+    // 过期会话清理每分钟最多一次(下面查询本身也校验 expires_at,不依赖清理及时)
+    if (!(now - (this.lastSweep || 0) < 60_000)) {
+      this.lastSweep = now;
+      this.sql.exec('DELETE FROM sessions WHERE expires_at < ?', now);
+    }
+    const s = this.sql
+      .exec('SELECT username, guest_nick FROM sessions WHERE token = ? AND expires_at >= ?', token, now)
+      .toArray()[0];
     if (!s) return null;
     if (s.guest_nick) {
       // 游客:无 users 行,可看可共享,但收/发画质由前端锁在游客档(码率上限,分辨率自动)
@@ -579,12 +612,16 @@ export class Auth extends DurableObject {
 // ---------- 服务器(单例):分类 / 频道 / 成员角色(SQLite) ----------
 
 const CHANNEL_TYPES = ['voice', 'text'];
+// Room 有人时每 ~60s 补报一次人数;超过这个时长没上报的条目视为失效(Room 异常退出没来得及报 0)
+const PRESENCE_TTL_MS = 3 * 60 * 1000;
 const ASSIGNABLE_ROLES = ['admin', 'member'];
 
 export class Guild extends DurableObject {
   constructor(ctx, env) {
     super(ctx, env);
     this.sql = ctx.storage.sql;
+    // 各频道在线人数(Room 上报):只放内存,Guild 被驱逐后靠 Room 的定期补报恢复
+    this.presence = new Map(); // roomId -> { count, at }
     ctx.blockConcurrencyWhile(async () => {
       this.sql.exec(`CREATE TABLE IF NOT EXISTS guild (
         id INTEGER PRIMARY KEY CHECK (id = 1),
@@ -786,13 +823,30 @@ export class Guild extends DurableObject {
   removeMember(username) {
     this.sql.exec("DELETE FROM members WHERE username = ? AND role != 'owner'", username);
   }
+
+  // Room 上报本频道人数(有人进出时 + 有人在时每 ~60s 补报)
+  setPresence(roomId, count) {
+    if (count > 0) this.presence.set(String(roomId), { count, at: Date.now() });
+    else this.presence.delete(String(roomId));
+  }
+
+  presenceCounts() {
+    const now = Date.now();
+    const out = {};
+    for (const [id, p] of this.presence) {
+      if (now - p.at > PRESENCE_TTL_MS) this.presence.delete(id);
+      else out[id] = p.count;
+    }
+    return out;
+  }
 }
 
 // ---------- 房间信令:每个房间一个 Durable Object 实例 ----------
 
 export class Room {
-  constructor(state) {
+  constructor(state, env) {
     this.state = state;
+    this.env = env;
     // 心跳:客户端每 ~10s 发 {type:'ping'},在 webSocketMessage 里刷新该连接的 lastSeen;
     // 定时 alarm 找出很久没 ping 的连接 = 已掉线(突然断网不会发关闭帧),清掉并广播离开。
   }
@@ -808,6 +862,7 @@ export class Room {
   async alarm() {
     const now = Date.now();
     const STALE_MS = 25000;
+    const closed = new Set();
     for (const ws of this.state.getWebSockets()) {
       const a = ws.deserializeAttachment() || {};
       const last = Math.max(a.lastSeen || 0, a.joinedAt || 0);
@@ -816,13 +871,30 @@ export class Room {
         try {
           ws.close(1001, 'timeout');
         } catch {}
+        closed.add(ws);
       }
     }
-    if (this.state.getWebSockets().length) await this.state.storage.setAlarm(now + 10000);
+    // 有人被清掉就立即上报;否则每 ~60s 补报一次,给 Guild 续期(Guild 被驱逐后也靠它恢复)
+    if (closed.size || now - (this.lastReport || 0) > 60_000) await this.reportPresence(closed);
+    if (this.state.getWebSockets().length > closed.size) await this.state.storage.setAlarm(now + 10000);
+  }
+
+  // 向 Guild 上报本频道已入座人数(exclude:正在关闭、但可能还留在 getWebSockets 里的连接)
+  async reportPresence(exclude = new Set()) {
+    if (!this.env?.GUILD) return;
+    this.room = this.room || (await this.state.storage.get('room'));
+    if (!this.room) return;
+    const count = this.state
+      .getWebSockets()
+      .filter((s) => !exclude.has(s) && s.deserializeAttachment()?.id).length;
+    this.lastReport = Date.now();
+    try {
+      await this.env.GUILD.get(this.env.GUILD.idFromName('global')).setPresence(this.room, count);
+    } catch {}
   }
 
   async fetch(request) {
-    // 非 WebSocket 请求 = 内部人数查询(/api/presence)
+    // 非 WebSocket 请求 = 内部人数查询(调试用;/api/presence 已改为读 Guild 上报值)
     if (request.headers.get('Upgrade') !== 'websocket') {
       return Response.json({ count: this.roster().length });
     }
@@ -834,6 +906,12 @@ export class Room {
     const nick = decodeURIComponent(request.headers.get('X-SP-Nick') || '') || '玩家';
     const user = request.headers.get('X-SP-User') || '';
     const canShare = request.headers.get('X-SP-Share') === '1';
+    // 记住自己是哪个频道(DO 休眠/重启后内存会丢,存一份到 storage)
+    const room = request.headers.get('X-SP-Room');
+    if (room && room !== this.room) {
+      this.room = room;
+      await this.state.storage.put('room', room);
+    }
     const pair = new WebSocketPair();
     // Hibernation API:空闲时 DO 休眠,不消耗运行时配额
     this.state.acceptWebSocket(pair[1]);
@@ -842,7 +920,7 @@ export class Room {
     return new Response(null, { status: 101, webSocket: pair[0] });
   }
 
-  webSocketMessage(ws, raw) {
+  async webSocketMessage(ws, raw) {
     let msg;
     try {
       msg = JSON.parse(raw);
@@ -869,11 +947,13 @@ export class Room {
         // 一账号一席:快速切频道时旧连接可能还没走完关闭握手(或同账号多开),
         // 会在成员列表里留下"分身"。踢掉旧连接并广播其离开。
         const kicked = new Set();
+        const kickedWs = new Set();
         for (const s of this.state.getWebSockets()) {
           if (s === ws) continue;
           const a = s.deserializeAttachment();
           if (a && a.id && a.user && a.user === att.user) {
             kicked.add(a.id);
+            kickedWs.add(s);
             this.broadcast({ type: 'peer-left', id: a.id }, s);
             try {
               s.close(1000, 'replaced');
@@ -888,6 +968,7 @@ export class Room {
         ws.send(JSON.stringify({ type: 'welcome', id, peers: others }));
 
         this.broadcast({ type: 'peer-joined', peer: { id, name, sharing: false, camera: false } }, ws);
+        await this.reportPresence(kickedWs);
         break;
       }
 
@@ -920,20 +1001,21 @@ export class Room {
     }
   }
 
-  webSocketClose(ws) {
-    this.dropPeer(ws);
+  async webSocketClose(ws) {
+    await this.dropPeer(ws);
   }
 
-  webSocketError(ws) {
-    this.dropPeer(ws);
+  async webSocketError(ws) {
+    await this.dropPeer(ws);
   }
 
-  dropPeer(ws) {
+  async dropPeer(ws) {
     const me = ws.deserializeAttachment();
     if (me && me.id) this.broadcast({ type: 'peer-left', id: me.id }, ws);
     try {
       ws.close();
     } catch {}
+    if (me && me.id) await this.reportPresence(new Set([ws]));
   }
 
   roster() {

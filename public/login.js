@@ -72,7 +72,7 @@ $('guestBtn').addEventListener('click', async () => {
   try {
     const r = await fetch('/api/guest', { method: 'POST' });
     if (r.ok) return go();
-    showError('游客进入失败,请重试');
+    showError(r.status === 429 ? '操作太频繁,请稍后再试' : '游客进入失败,请重试');
   } catch {
     showError('网络错误,请重试');
   }
