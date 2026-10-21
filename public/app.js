@@ -329,6 +329,8 @@ async function joinChannel(id, name, topic) {
   if (state.channelId === id) return;
   if (state.channelId) leaveChannel(false);
 
+  // 每次进频道刷新一次服务器设置:管理员改了「强制中继」等,其他人下次进频道即生效,无需刷新页面
+  await loadGuild();
   // 没有麦克风时不阻塞:只共享/观看画面、收听别人语音
   if (!state.micTrack) state.micTrack = await acquireMic();
   if (state.iceServers.length <= 1) {
@@ -611,7 +613,7 @@ function sendSignal(to, data) {
 
 function createPeerConnection(peerId) {
   const peer = state.peers.get(peerId);
-  const pc = new RTCPeerConnection({ iceServers: state.iceServers });
+  const pc = new RTCPeerConnection({ iceServers: state.iceServers, iceTransportPolicy: relayPolicy() });
   peer.pc = pc;
   peer.videoStream = new MediaStream();
   peer.camStream = new MediaStream();
@@ -720,6 +722,13 @@ async function doIceRestart(peerId) {
     await peer.pc.setLocalDescription(offer);
     sendSignal(peerId, { sdp: peer.pc.localDescription });
   } catch {}
+}
+
+// 服务器开了「强制中继」且确实拿到了 TURN 凭证 → 只用 relay 候选;
+// 没有 TURN 时退回 all,否则只剩 relay 候选会谁都连不上
+function relayPolicy() {
+  const hasTurn = state.iceServers.some((s) => [].concat(s.urls).some((u) => /^turns?:/.test(u)));
+  return state.guild?.guild?.forceRelay && hasTurn ? 'relay' : 'all';
 }
 
 function setupTransceivers(pc, asOfferer) {
@@ -1457,6 +1466,19 @@ function openServerSettings() {
   const clear = numInput(q.clear);
   const smooth = numInput(q.smooth);
   const guest = numInput(q.guest);
+  // 强制中继开关:没配置 TURN 时禁用(开了也无效)
+  const relay = document.createElement('input');
+  relay.type = 'checkbox';
+  relay.checked = !!g.forceRelay;
+  relay.disabled = !state.guild.relayAvailable && !g.forceRelay;
+  const relayLabel = document.createElement('label');
+  relayLabel.className = 'field field-check';
+  relayLabel.append(relay, ' 所有连接强制走 TURN 中继(不尝试 P2P 直连)');
+  const relayNote = document.createElement('p');
+  relayNote.className = 'field-note';
+  relayNote.textContent = state.guild.relayAvailable
+    ? '画面和语音全部经你的 TURN 服务器转发,会占用服务器带宽/流量,延迟略增。保存后,每个人下次进入频道时生效。'
+    : '未配置 TURN 服务器(COTURN_* 或 TURN_KEY_*),无法开启。';
   const note = document.createElement('p');
   note.className = 'field-note';
   note.textContent = '各档「码率上限(kbps)」,分辨率由编码器按码率自动决定。高清档固定 3.5Mbps;以下三档可调:';
@@ -1469,6 +1491,8 @@ function openServerSettings() {
     field('清晰档', clear),
     field('流畅档(默认)', smooth),
     field('游客档(游客共享/观看)', guest),
+    relayLabel,
+    relayNote,
   );
   openModal('服务器设置', body, async () => {
     if (!name.value.trim()) return false;
@@ -1479,6 +1503,7 @@ function openServerSettings() {
       clearKbps: +clear.value,
       smoothKbps: +smooth.value,
       guestKbps: +guest.value,
+      forceRelay: relay.checked,
     });
     if (!r.ok) return (alert(r.error || '保存失败'), false);
     await loadGuild();

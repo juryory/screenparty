@@ -301,6 +301,8 @@ export default {
       return Response.json({
         ...(await guild.tree()),
         me: { username: user.username, nickname: user.nickname, role },
+        // 是否配置了 TURN:没有时"强制中继"无法生效(只剩 relay 候选会全连不上),前端据此禁用开关
+        relayAvailable: !!((env.COTURN_HOST && env.COTURN_SECRET) || (env.TURN_KEY_ID && env.TURN_KEY_API_TOKEN)),
       });
     }
     if (url.pathname === '/api/guild' && method === 'PATCH') {
@@ -641,10 +643,11 @@ export class Guild extends DurableObject {
         description TEXT NOT NULL DEFAULT '',
         clear_kbps  INTEGER NOT NULL DEFAULT 2500,
         smooth_kbps INTEGER NOT NULL DEFAULT 1500,
-        guest_kbps  INTEGER NOT NULL DEFAULT 800
+        guest_kbps  INTEGER NOT NULL DEFAULT 800,
+        force_relay INTEGER NOT NULL DEFAULT 0
       )`);
       // 迁移:旧库补画质档码率列(新库建表已含,ALTER 抛错跳过)
-      for (const col of ['clear_kbps INTEGER NOT NULL DEFAULT 2500', 'smooth_kbps INTEGER NOT NULL DEFAULT 1500', 'guest_kbps INTEGER NOT NULL DEFAULT 800']) {
+      for (const col of ['clear_kbps INTEGER NOT NULL DEFAULT 2500', 'smooth_kbps INTEGER NOT NULL DEFAULT 1500', 'guest_kbps INTEGER NOT NULL DEFAULT 800', 'force_relay INTEGER NOT NULL DEFAULT 0']) {
         try {
           this.sql.exec(`ALTER TABLE guild ADD COLUMN ${col}`);
         } catch {}
@@ -713,7 +716,7 @@ export class Guild extends DurableObject {
 
   tree() {
     const g =
-      this.sql.exec('SELECT name, icon, description, clear_kbps, smooth_kbps, guest_kbps FROM guild WHERE id = 1').toArray()[0] ||
+      this.sql.exec('SELECT name, icon, description, clear_kbps, smooth_kbps, guest_kbps, force_relay FROM guild WHERE id = 1').toArray()[0] ||
       { name: 'ScreenParty', icon: '🎮', description: '' };
     const guild = {
       name: g.name,
@@ -721,6 +724,8 @@ export class Guild extends DurableObject {
       description: g.description,
       // 共享画质档码率(kbps):高清固定 3500,清晰/流畅/游客 由管理员可配
       quality: { clear: g.clear_kbps ?? 2500, smooth: g.smooth_kbps ?? 1500, guest: g.guest_kbps ?? 800 },
+      // 强制所有连接走 TURN 中继(不尝试 P2P 直连)
+      forceRelay: !!g.force_relay,
     };
     const categories = this.sql.exec('SELECT id, name, position FROM categories ORDER BY position, name').toArray();
     const channels = this.sql
@@ -782,7 +787,7 @@ export class Guild extends DurableObject {
     return crypto.subtle.verify('HMAC', await this.ticketKey(), hexToBytes(m[2]), this.ticketPayload(channelId, username, m[1], stored));
   }
 
-  updateGuild({ name, icon, description, clearKbps, smoothKbps, guestKbps } = {}) {
+  updateGuild({ name, icon, description, clearKbps, smoothKbps, guestKbps, forceRelay } = {}) {
     if (name !== undefined) {
       const n = String(name).trim().slice(0, 32);
       if (!n) return { ok: false, status: 400, error: '服务器名不能为空' };
@@ -795,6 +800,7 @@ export class Guild extends DurableObject {
     if (clearKbps !== undefined) this.sql.exec('UPDATE guild SET clear_kbps = ? WHERE id = 1', clampKbps(clearKbps));
     if (smoothKbps !== undefined) this.sql.exec('UPDATE guild SET smooth_kbps = ? WHERE id = 1', clampKbps(smoothKbps));
     if (guestKbps !== undefined) this.sql.exec('UPDATE guild SET guest_kbps = ? WHERE id = 1', clampKbps(guestKbps));
+    if (forceRelay !== undefined) this.sql.exec('UPDATE guild SET force_relay = ? WHERE id = 1', forceRelay ? 1 : 0);
     return { ok: true };
   }
 
