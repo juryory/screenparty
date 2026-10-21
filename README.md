@@ -70,108 +70,68 @@ git push -u origin main
    ```
 3. 重新部署。前端会自动从 `/api/turn` 拿到临时凭证,无需改代码。
 
-**方案 B:自建 coturn(国内 VPS,推荐)—— 从零搭建教程**
+**方案 B:自建 coturn(国内 VPS,推荐)—— Docker 一键部署**
 
-> 适用:一台国内云服务器(腾讯云等),已重装为 **Ubuntu/Debian**。宝塔面板可选(用于看负载、放行端口、申请 TLS 证书,不是必需)。前端会自动从 `/api/turn` 拿到**临时凭证**(`use-auth-secret` 的 HMAC 签名,会过期,抓包也无法长期盗用你的中继带宽)。全程约 10 分钟。
+> 适用:一台国内云服务器(腾讯云等,Ubuntu/Debian),已装 Docker(宝塔 → Docker 一键装,或 `curl -fsSL https://get.docker.com | sh -s -- --mirror Aliyun`)。宝塔可选(看负载、放行端口、申请 TLS 证书)。前端会自动从 `/api/turn` 拿到**临时凭证**(`use-auth-secret` 的 HMAC 签名,会过期,抓包也无法长期盗用你的中继带宽)。全程约 5 分钟。
+>
+> 部署内容都在 [`deploy/`](deploy/):官方 `coturn/coturn` 镜像 + 启动时按 `.env` 生成配置(含完整的内网黑名单、中继地址固定在主网卡),**host 网络**运行(大段 UDP 中继端口不走 Docker 端口映射),coturn 启动后自动降权到 `nobody`。以后上 SFU 也会加在同一个 compose 里。
 
-**第 1 步 · 安装 coturn**
+**第 1 步 · 一键安装**(在服务器上执行)
 ```bash
-sudo apt update && sudo apt install -y coturn
-sudo sed -i 's/#TURNSERVER_ENABLED/TURNSERVER_ENABLED/' /etc/default/coturn
+# 用 jsDelivr CDN(国内可达;raw.githubusercontent.com 在国内常连不上)
+curl -fsSL https://cdn.jsdelivr.net/gh/juryory/screenparty@main/deploy/install.sh | sudo bash
 ```
+脚本会:把部署文件放到 `/opt/screenparty`、安装 `party` 管理命令、运行 `party init` 交互填写(公网 IP 必填;内网 IP 自动探测;密钥自动生成;TLS 证书目录可留空),然后拉镜像启动。重复运行安全,不会覆盖已有 `.env`。
 
-**第 2 步 · 生成配置**(先把公网 IP 填进第一行,再整段粘贴)
-```bash
-PUBLIC_IP=1.2.3.4                 # ← 改成你的公网 IP(腾讯云控制台可见;国内机器别用 ipify 等境外服务自动探测,常取不到)
-PRIVATE_IP=$(ip route get 1.1.1.1 | grep -oP 'src \K\S+')   # 主内网 IP(走默认路由那块网卡,自动避开 VPN 等副网卡)
-SECRET=$(openssl rand -hex 32)
-[ -n "$PUBLIC_IP" ] && [ -n "$PRIVATE_IP" ] || { echo "公网/内网 IP 没填好,先确认再来"; }
-echo "external-ip 将写成:$PUBLIC_IP/$PRIVATE_IP"   # 务必确认斜杠两边都不为空!
-sudo tee /etc/turnserver.conf >/dev/null <<EOF
-listening-port=3478
-# 腾讯云网卡只有内网 IP、公网走 NAT,必须做 公网/内网 映射:
-external-ip=$PUBLIC_IP/$PRIVATE_IP
-min-port=49160
-max-port=49400
-use-auth-secret
-static-auth-secret=$SECRET
-realm=$PUBLIC_IP
-no-cli
-no-tcp-relay
-# 收敛滥用面:禁止被拿去中继内网 / 云元数据
-no-multicast-peers
-denied-peer-ip=0.0.0.0-0.255.255.255
-denied-peer-ip=10.0.0.0-10.255.255.255
-denied-peer-ip=100.64.0.0-100.127.255.255
-denied-peer-ip=127.0.0.0-127.255.255.255
-denied-peer-ip=169.254.0.0-169.254.255.255
-denied-peer-ip=172.16.0.0-172.31.255.255
-denied-peer-ip=192.168.0.0-192.168.255.255
-denied-peer-ip=::1
-denied-peer-ip=fc00::-fdff:ffff:ffff:ffff:ffff:ffff:ffff:ffff
-denied-peer-ip=fe80::-febf:ffff:ffff:ffff:ffff:ffff:ffff:ffff
-EOF
-echo "==== 下面两个值第 6 步要填到 Worker,记下来 ===="
-echo "COTURN_SECRET = $SECRET"
-echo "COTURN_HOST   = $PUBLIC_IP"
-```
+- **从旧版裸装 coturn 迁移**:`party init` 会自动读取 `/etc/turnserver.conf` 里的密钥和 IP 沿用(**Worker 的 secret 不用改**),并提示停止、禁用系统里的 coturn 服务以免端口冲突
+- **Docker Hub 拉不动**(国内常见):编辑 `/opt/screenparty/.env` 的 `TURN_IMAGE`,换成镜像加速地址(如 `docker.m.daocloud.io/coturn/coturn:4.6.3`)或你自己同步到腾讯云 TCR 的地址,再 `sudo party start`
+- jsDelivr 对 `@main` 有缓存(更新后可能延迟几小时);想立刻拿最新版,把 `@main` 换成 commit 短哈希
 
-> **按旧版教程装过的**:旧配置漏了 `172.16.0.0/12`(很多云内网)、`100.64.0.0/10`(腾讯云等内网/CGNAT)和回环、IPv6 内网段,拿到凭证的人可借中继访问你 VPS 所在内网。把上面整组 `denied-peer-ip=` 行替换进 `/etc/turnserver.conf`,再 `sudo systemctl restart coturn` 即可。
-
-**第 3 步 · 放行端口(两层都要,少一层就连不上)**
+**第 2 步 · 放行端口(两层都要,少一层就连不上)**
 - **腾讯云控制台 → 安全组 → 入站规则**:
   - `3478` TCP + UDP —— STUN/TURN
   - `49160-49400` UDP —— 中继端口段(开了「强制中继」时每对连接都占端口,范围别太小)
   - (配 TLS 才需要)`5349` TCP + UDP
 - **宝塔面板 → 安全 → 防火墙**:放行同样端口,**务必勾选 UDP**(宝塔默认常只放 TCP,漏了 UDP 会连不上)
 
-**第 4 步 · 启动并设为开机自启**
+**第 3 步 · 接进 Worker**(在你本地电脑的本仓库目录执行,不是在 VPS 上)
+
+服务器上 `sudo party worker` 会列出要填的值:
 ```bash
-sudo systemctl enable --now coturn
-```
-
-**第 5 步 · 安装 `party` 管理命令**(可选,像宝塔的 bt 一样管服务)
-```bash
-# 用 jsDelivr CDN(国内可达;raw.githubusercontent.com 在国内常连不上)
-sudo curl -fsSL "https://cdn.jsdelivr.net/gh/juryory/screenparty@main/scripts/party" -o /usr/local/bin/party
-sudo chmod +x /usr/local/bin/party
-sudo party status     # 应显示「● coturn 运行中」、监听 3478
-```
-
-> jsDelivr 对 `@main` 有缓存(更新脚本后可能延迟几小时);想立刻拿最新版,把 `@main` 换成对应的 commit 短哈希即可。
-
-| 命令 | 作用 |
-|------|------|
-| `party` | **交互菜单**:输数字选操作(状态/启停/重启/日志/自启/配置),像宝塔那样 |
-| `party status` | 看状态:运行/停止、external-ip、监听端口、活跃连接数 |
-| `party start` / `stop` / `restart` | 启动 / 关闭 / 重启(改完配置用 `restart` 生效) |
-| `party on` / `off` | 开机自启 开 / 关 |
-| `party log` | 实时日志(排查问题) |
-| `party conf` | 查看配置文件 |
-
-**第 6 步 · 接进 Worker**(在你本地电脑的本仓库目录执行,不是在 VPS 上)
-```bash
-wrangler secret put COTURN_SECRET     # 粘贴第 2 步输出的 SECRET
-wrangler secret put COTURN_HOST       # 第 2 步的公网 IP 或你的域名,不带端口
+wrangler secret put COTURN_HOST       # 公网 IP 或你的域名,不带端口
+wrangler secret put COTURN_SECRET     # party worker 显示的密钥
 wrangler deploy                        # 重新部署使其生效
 ```
 
-**第 7 步 · 验证**
+**第 4 步 · 验证**
+- `sudo party status` 应显示「● coturn 运行中」、监听 3478
 - 打开 `https://你的部署地址/api/turn`,看到 `turn:...` 且带 `username`/`credential` → 接入成功
 - 想确认真能中继:用 [Trickle ICE 测试页](https://webrtc.github.io/samples/src/content/peerconnection/trickle-ice/) 填 `turn:你的公网IP:3478?transport=udp` + 上面的 `username`/`credential`,点 **Gather candidates**,出现 `relay` 类型候选 = 中继链路已通
+
+**`party` 管理命令**(像宝塔的 bt 一样管服务;需 root,非 root 自动 sudo)
+
+| 命令 | 作用 |
+|------|------|
+| `party` | **交互菜单**:输数字选操作,像宝塔那样 |
+| `party status` | 看状态:运行/停止、开机自启、external-ip、监听端口、活跃连接数 |
+| `party start` / `stop` / `restart` | 启动 / 关闭 / 重启(改完 `.env` 用 `restart` 生效) |
+| `party on` / `off` | 开机自启 开 / 关 |
+| `party log` | 实时日志(排查问题) |
+| `party conf` | 查看当前生效的 coturn 配置(密钥隐藏) |
+| `party init` | 重新配置(换公网 IP、加证书等) |
+| `party update` | 拉取最新镜像并重建容器 |
+| `party worker` | 显示 Worker 需要配置的 secret 值 |
+
+配置都在 `/opt/screenparty/.env`(说明见 [`deploy/.env.example`](deploy/.env.example)),改完 `sudo party restart`。
 
 **(进阶 · 可选)开启 TLS —— 让 `turns://` 穿透只放行 443/加密流量的严格网络**
 
 需要一个域名(如 `turn.你的域名`)解析到这台服务器:
 
 1. 宝塔 → 网站 → 为 `turn.你的域名` 申请 Let's Encrypt 证书
-2. 在 `/etc/turnserver.conf` 末尾追加(**用 5349,别用 443**——443 被宝塔的网站占着,会冲突):
-   ```ini
-   tls-listening-port=5349
-   cert=/www/server/panel/vhost/cert/turn.你的域名/fullchain.pem
-   pkey=/www/server/panel/vhost/cert/turn.你的域名/privkey.pem
-   ```
-3. `sudo party restart`;然后在本地仓库目录执行 `wrangler secret put COTURN_TLS_HOST`(填 `turn.你的域名`),再 `wrangler deploy`
+2. `sudo party init`,证书目录填 `/www/server/panel/vhost/cert/turn.你的域名`(目录里需有 `fullchain.pem` 和 `privkey.pem`),端口默认 **5349**(别用 443,被宝塔的网站占着)
+3. `sudo party restart`,日志里会出现「TLS 已启用」;然后在本地仓库目录执行 `wrangler secret put COTURN_TLS_HOST`(填 `turn.你的域名`),再 `wrangler deploy`
+4. 证书续签后执行一次 `sudo party restart` 才会加载新证书(可在宝塔计划任务里每月跑一次)
 
 > **带宽**:每路屏幕 ~3.5 Mbps,一对中转连接在服务器上约占 **3.5 Mbps 入 + 3.5 Mbps 出**。
 > 200M 峰值带宽可轻松扛住十几路中转;而且 TURN 只对**少数打洞失败的成员对**生效,绝大多数人仍是 P2P 直连,不经过这台机器。
@@ -179,7 +139,7 @@ wrangler deploy                        # 重新部署使其生效
 **(可选)强制所有连接走中继**:服务器 ⌄ 菜单 →「服务器设置」勾选「所有连接强制走 TURN 中继」,每个人下次进频道时生效,画面角标会显示「TURN中继」。适合个别成员之间 P2P 线路差(跨运营商丢包等)的情况。注意:
 - 全部音视频都经过服务器,按 3 人、1 人共享 3.5Mbps、每天 3.5 小时估算,服务器出站约 **330 GB/月**,留意轻量服务器的月流量包;延迟会比同城直连多十几到几十毫秒
 - 仍是 mesh:共享者上行不变(每个观看者一份),中继只负责转发
-- 每对连接两端各占一个中继端口,8 人满房约需 56 个,所以上面端口段放宽到 `49160-49400`。按旧版教程(`49160-49200`)装过的,改 `/etc/turnserver.conf` 的 `max-port` 并同步放行安全组/宝塔防火墙后 `sudo systemctl restart coturn`
+- 每对连接两端各占一个中继端口,8 人满房约需 56 个,所以端口段默认 `49160-49400`(`.env` 的 `TURN_MIN_PORT` / `TURN_MAX_PORT`),安全组 / 宝塔防火墙要同步放行
 - 未配置 TURN(`COTURN_*` / `TURN_KEY_*`)时该开关不可用
 
 ### 怎么判断某人是不是走了 relay(以及值不值得自建 coturn)

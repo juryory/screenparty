@@ -1,0 +1,29 @@
+# ScreenParty 服务器端组件(Docker 部署)
+#
+# 目前只有 TURN 中继(coturn);以后上 SFU 时在这里加服务,用 profile 区分。
+# 配置全部写在同目录 .env(由 `party init` 生成,模板见 .env.example)。
+#
+# 用 host 网络而非端口映射:TURN 要用一大段 UDP 中继端口,
+# 端口映射会给每个端口起 docker-proxy / iptables 规则,又慢又多一层 NAT。
+
+services:
+  turn:
+    image: ${TURN_IMAGE:-coturn/coturn:4.6.3}
+    container_name: screenparty-turn
+    network_mode: host
+    # 开机自启:party on / off 切换(写 .env 的 TURN_RESTART)
+    restart: ${TURN_RESTART:-unless-stopped}
+    # 以 root 启动只为读取宝塔等签发的证书(通常仅 root 可读),
+    # coturn 初始化后会按配置里的 proc-user 降权到 nobody
+    user: "0:0"
+    entrypoint: ["/bin/sh", "/screenparty/entrypoint.sh"]
+    env_file: .env
+    volumes:
+      - ./coturn/entrypoint.sh:/screenparty/entrypoint.sh:ro
+      # TLS 证书目录(含 fullchain.pem / privkey.pem);不开 TLS 时指向空目录即可
+      - ${TURN_CERT_DIR:-./certs}:/certs:ro
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"

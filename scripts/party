@@ -1,50 +1,212 @@
 #!/usr/bin/env bash
-# party —— ScreenParty 兜底服务器(coturn)便捷管理命令
+# party —— ScreenParty 服务器端(Docker 版 coturn)便捷管理命令
 #
-# 安装(在服务器上执行一次):
-#   sudo install -m 0755 scripts/party /usr/local/bin/party
+# 安装:见 README「TURN 兜底 · 方案 B」,一条命令装好 Docker 部署 + 本命令:
+#   curl -fsSL https://cdn.jsdelivr.net/gh/juryory/screenparty@main/deploy/install.sh | sudo bash
 #
 # 两种用法:
-#   party              # 直接进入交互菜单(输数字选操作,像宝塔那样)
+#   party              # 交互菜单(输数字选操作,像宝塔那样)
 #   party <子命令>     # 一条命令直达,便于脚本:
-#       status  start  stop  restart  reload  on  off  log  conf
+#       init  status  start  stop  restart  reload  on  off  log  conf  update  worker
 #
-# 提示:操作服务需 root;非 root 时会自动用 sudo。
+# 部署目录默认 /opt/screenparty(可用环境变量 PARTY_DIR 覆盖),内含
+# docker-compose.yml / .env / coturn/entrypoint.sh / certs/。
+# 提示:操作 Docker 需 root;非 root 时会自动用 sudo。
 
 set -uo pipefail
 
-SVC=coturn
-CONF=/etc/turnserver.conf
+DIR=${PARTY_DIR:-/opt/screenparty}
+ENV_FILE="$DIR/.env"
+CONTAINER=screenparty-turn
+OLD_CONF=/etc/turnserver.conf # 旧版裸装 coturn 的配置,init 时用来迁移
 
-# 用 root 权限跑 systemctl(已是 root 直接跑,否则套 sudo)
-sysctl_do() {
-  if [ "$(id -u)" -eq 0 ]; then systemctl "$@"; else sudo systemctl "$@"; fi
+as_root() {
+  if [ "$(id -u)" -eq 0 ]; then "$@"; else sudo "$@"; fi
+}
+
+compose() {
+  if as_root docker compose version >/dev/null 2>&1; then
+    as_root docker compose --project-directory "$DIR" -f "$DIR/docker-compose.yml" "$@"
+  elif command -v docker-compose >/dev/null 2>&1; then
+    as_root docker-compose --project-directory "$DIR" -f "$DIR/docker-compose.yml" "$@"
+  else
+    echo "✗ 未找到 docker compose,请先安装 Docker(含 compose 插件)" >&2
+    return 1
+  fi
+}
+
+# 读 / 写 .env 里的一项
+env_get() {
+  as_root sed -n "s/^$1=//p" "$ENV_FILE" 2>/dev/null | tail -1
+}
+env_set() {
+  local key=$1 val=$2
+  if as_root grep -q "^$key=" "$ENV_FILE" 2>/dev/null; then
+    as_root sed -i "s|^$key=.*|$key=$val|" "$ENV_FILE"
+  else
+    echo "$key=$val" | as_root tee -a "$ENV_FILE" >/dev/null
+  fi
+}
+
+require_env() {
+  if ! as_root test -f "$ENV_FILE"; then
+    echo "✗ 还没有配置:$ENV_FILE 不存在,先运行 party init" >&2
+    return 1
+  fi
+}
+
+state() {
+  as_root docker inspect -f '{{.State.Status}}' "$CONTAINER" 2>/dev/null || echo "未创建"
 }
 
 svc() {
   case "$1" in
-    start)   sysctl_do start   "$SVC" && echo "✓ coturn 已启动" ;;
-    stop)    sysctl_do stop    "$SVC" && echo "✓ coturn 已停止" ;;
-    restart) sysctl_do restart "$SVC" && echo "✓ coturn 已重启" ;;
-    reload)  sysctl_do reload-or-restart "$SVC" && echo "✓ 配置已重载" ;;
-    on)      sysctl_do enable  "$SVC" && echo "✓ 已设为开机自启" ;;
-    off)     sysctl_do disable "$SVC" && echo "✓ 已取消开机自启" ;;
+    start)
+      require_env || return 1
+      compose up -d && echo "✓ coturn 已启动" ;;
+    stop) compose stop && echo "✓ coturn 已停止" ;;
+    restart | reload)
+      # up -d 会在 .env / compose 变化时重建容器,未变化时再 restart 让入口脚本重新生成配置
+      require_env || return 1
+      compose up -d && compose restart && echo "✓ coturn 已重启(配置已重新生成)" ;;
+    on)
+      require_env || return 1
+      env_set TURN_RESTART unless-stopped
+      as_root systemctl enable docker >/dev/null 2>&1 || true
+      compose up -d && echo "✓ 已设为开机自启(Docker 开机自启 + 容器 unless-stopped)" ;;
+    off)
+      require_env || return 1
+      env_set TURN_RESTART "no"
+      compose up -d && echo "✓ 已取消开机自启(下次开机 coturn 不会自动启动)" ;;
   esac
 }
 
 conns_now() {
-  ss -Htunap 2>/dev/null | awk '/turnserver/ && $2 ~ /ESTAB/ {n++} END {print n + 0}'
+  as_root ss -Htunap 2>/dev/null | awk '/turnserver/ && $2 ~ /ESTAB/ {n++} END {print n + 0}'
 }
 
 show_status() {
-  if systemctl is-active --quiet "$SVC"; then echo "● coturn 运行中"; else echo "○ coturn 已停止"; fi
-  if systemctl is-enabled --quiet "$SVC" 2>/dev/null; then echo "  开机自启:是"; else echo "  开机自启:否"; fi
-  local ext ports
-  ext=$(grep -E '^external-ip=' "$CONF" 2>/dev/null | head -1 | cut -d= -f2)
-  ports=$(ss -tunlp 2>/dev/null | grep -i turnserver | awk '{print $5}' | sort -u | tr '\n' ' ')
-  [ -n "$ext" ] && echo "  external-ip:$ext"
-  echo "  监听:${ports:-未监听(需 sudo 才能显示)}"
-  echo "  活跃连接:$(conns_now)(需 sudo 才准)"
+  local st policy
+  st=$(state)
+  if [ "$st" = running ]; then echo "● coturn 运行中(Docker 容器 $CONTAINER)"; else echo "○ coturn $st"; fi
+  policy=$(as_root docker inspect -f '{{.HostConfig.RestartPolicy.Name}}' "$CONTAINER" 2>/dev/null || true)
+  case "$policy" in
+    always | unless-stopped) echo "  开机自启:是" ;;
+    *) echo "  开机自启:否" ;;
+  esac
+  local pub priv ports
+  pub=$(env_get TURN_PUBLIC_IP)
+  priv=$(env_get TURN_PRIVATE_IP)
+  [ -n "$pub" ] && echo "  external-ip:$pub${priv:+/$priv}"
+  echo "  中继端口:$(env_get TURN_MIN_PORT)-$(env_get TURN_MAX_PORT)"
+  ports=$(as_root ss -tunlp 2>/dev/null | grep -i turnserver | awk '{print $5}' | sort -u | tr '\n' ' ')
+  echo "  监听:${ports:-未监听}"
+  echo "  活跃连接:$(conns_now)"
+  echo "  部署目录:$DIR"
+}
+
+# Worker 侧需要配置的值(在本地仓库目录用 wrangler secret put 设置)
+show_worker() {
+  require_env || return 1
+  local port tlsdir
+  port=$(env_get TURN_PORT)
+  tlsdir=$(env_get TURN_CERT_DIR)
+  echo "在本地仓库目录执行以下命令,把对应值粘进去(不是在这台服务器上):"
+  echo "  wrangler secret put COTURN_HOST     → $(env_get TURN_PUBLIC_IP)"
+  echo "  wrangler secret put COTURN_SECRET   → $(env_get TURN_SECRET)"
+  [ -n "$port" ] && [ "$port" != 3478 ] && echo "  wrangler secret put COTURN_PORT     → $port"
+  if [ -n "$tlsdir" ]; then
+    echo "  wrangler secret put COTURN_TLS_HOST → 证书对应的域名(如 turn.你的域名)"
+    [ "$(env_get TURN_TLS_PORT)" != 5349 ] && echo "  wrangler secret put COTURN_TLS_PORT → $(env_get TURN_TLS_PORT)"
+  fi
+  echo "  wrangler deploy"
+}
+
+# ---------- init:生成 .env(可从旧版裸装 coturn 迁移) ----------
+
+ask() { # ask <提示> <默认值> → 输出用户输入或默认值
+  local reply
+  if [ -t 0 ]; then
+    read -rp "$1${2:+ [$2]}: " reply || reply=""
+  else
+    reply="" # 非交互(管道安装):全用默认值
+  fi
+  echo "${reply:-$2}"
+}
+
+old_conf_get() {
+  as_root sed -n "s/^$1=//p" "$OLD_CONF" 2>/dev/null | head -1
+}
+
+do_init() {
+  as_root mkdir -p "$DIR/certs"
+  local pub priv secret certdir old_ext
+  # 优先已有 .env,其次环境变量(无人值守安装用)
+  pub=$(env_get TURN_PUBLIC_IP); pub=${pub:-${TURN_PUBLIC_IP:-}}
+  priv=$(env_get TURN_PRIVATE_IP); priv=${priv:-${TURN_PRIVATE_IP:-}}
+  secret=$(env_get TURN_SECRET); secret=${secret:-${TURN_SECRET:-}}
+  certdir=$(env_get TURN_CERT_DIR); certdir=${certdir:-${TURN_CERT_DIR:-}}
+
+  # 迁移:旧版教程是裸装 coturn,沿用它的密钥和 IP,Worker 里的 secret 不用改
+  if as_root test -f "$OLD_CONF" && [ -z "$secret" ]; then
+    echo "发现旧版 coturn 配置 $OLD_CONF,沿用其中的密钥和 IP(Worker 无需改动)"
+    old_ext=$(old_conf_get external-ip)
+    [ -z "$pub" ] && pub=${old_ext%%/*}
+    [ -z "$priv" ] && case "$old_ext" in */*) priv=${old_ext#*/} ;; esac
+    secret=$(old_conf_get static-auth-secret)
+    [ -z "$certdir" ] && certdir=$(dirname "$(old_conf_get cert)" 2>/dev/null)
+    [ "$certdir" = . ] && certdir=""
+  fi
+
+  [ -z "$priv" ] && priv=$(ip route get 1.1.1.1 2>/dev/null | grep -oP 'src \K\S+' || true)
+  pub=$(ask "公网 IP(云控制台可见)" "$pub")
+  priv=$(ask "主内网 IP(自动探测,没有 NAT 可清空)" "$priv")
+  certdir=$(ask "TLS 证书目录(含 fullchain.pem/privkey.pem,留空不开 TLS)" "$certdir")
+  [ -z "$secret" ] && secret=$(openssl rand -hex 32 2>/dev/null || head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')
+
+  if [ -z "$pub" ]; then
+    echo "✗ 公网 IP 不能为空" >&2
+    return 1
+  fi
+
+  if ! as_root test -f "$ENV_FILE"; then
+    if as_root test -f "$DIR/.env.example"; then as_root cp "$DIR/.env.example" "$ENV_FILE"; else as_root touch "$ENV_FILE"; fi
+  fi
+  as_root chmod 600 "$ENV_FILE"
+  env_set TURN_PUBLIC_IP "$pub"
+  env_set TURN_PRIVATE_IP "$priv"
+  env_set TURN_SECRET "$secret"
+  env_set TURN_CERT_DIR "$certdir"
+  echo "✓ 已写入 $ENV_FILE"
+
+  # 旧版裸装 coturn 还在跑会占 3478 端口,和容器冲突
+  if systemctl is-active --quiet coturn 2>/dev/null || systemctl is-enabled --quiet coturn 2>/dev/null; then
+    local yn
+    yn=$(ask "检测到系统里的 coturn 服务(旧版裸装),停止并禁用它以免端口冲突?(Y/n)" "Y")
+    case "$yn" in
+      n | N) echo "  已跳过;启动前请自行停止,否则容器会因端口占用起不来" ;;
+      *) as_root systemctl disable --now coturn && echo "✓ 旧版 coturn 已停止并禁用" ;;
+    esac
+  fi
+
+  echo
+  show_worker
+  echo
+  echo "下一步:party start;并确认云安全组 / 宝塔防火墙已放行 $(env_get TURN_PORT) TCP+UDP、$(env_get TURN_MIN_PORT)-$(env_get TURN_MAX_PORT) UDP"
+}
+
+do_update() {
+  require_env || return 1
+  compose pull && compose up -d && echo "✓ 已拉取最新镜像并重建容器"
+}
+
+show_conf() {
+  if [ "$(state)" = running ]; then
+    as_root docker exec "$CONTAINER" cat /tmp/turnserver.conf | sed 's/^\(static-auth-secret=\).*/\1********(见 party worker)/' | "${PAGER:-less}"
+  else
+    echo "容器未运行,显示 .env(密钥已隐藏):"
+    as_root sed 's/^\(TURN_SECRET=\).*/\1********/' "$ENV_FILE" | "${PAGER:-less}"
+  fi
 }
 
 # ---------- 交互菜单 ----------
@@ -53,7 +215,7 @@ pause() { read -rp $'\n按回车返回菜单… ' _ || true; }
 
 header() {
   local st
-  if systemctl is-active --quiet "$SVC"; then st="● 运行中"; else st="○ 已停止"; fi
+  if [ "$(state)" = running ]; then st="● 运行中"; else st="○ 已停止"; fi
   clear 2>/dev/null || true
   echo "════════════════════════════════════════"
   echo "   ScreenParty TURN 管理    coturn:$st"
@@ -63,16 +225,14 @@ header() {
 menu_autostart() {
   while true; do
     header
-    local cur
-    cur=$(systemctl is-enabled "$SVC" 2>/dev/null || echo 未知)
-    echo "  开机自启(当前:$cur)"
+    echo "  开机自启"
     echo
     echo "   1) 开启开机自启"
     echo "   2) 关闭开机自启"
     echo "   0) 返回上级"
     read -rp $'\n请选择编号: ' c || return
     case "$c" in
-      1) svc on;  pause ;;
+      1) svc on; pause ;;
       2) svc off; pause ;;
       0) return ;;
       *) echo "无效选择"; sleep 1 ;;
@@ -86,23 +246,29 @@ run_menu() {
     echo "   1) 查看状态"
     echo "   2) 启动 coturn"
     echo "   3) 停止 coturn"
-    echo "   4) 重启 coturn(改完配置用它生效)"
+    echo "   4) 重启 coturn(改完 .env 用它生效)"
     echo "   5) 实时日志(Ctrl-C 返回)"
     echo "   6) 开机自启设置 ▶"
-    echo "   7) 查看配置文件"
+    echo "   7) 查看生效配置"
     echo "   8) 当前活跃连接数"
+    echo "   9) 重新配置(公网 IP / 证书等)"
+    echo "  10) 更新镜像"
+    echo "  11) 查看 Worker 需配置的值"
     echo "   0) 退出"
     read -rp $'\n请选择编号: ' choice || { echo; exit 0; }
     case "$choice" in
       1) echo; show_status; pause ;;
-      2) echo; svc start;   pause ;;
-      3) echo; svc stop;    pause ;;
+      2) echo; svc start; pause ;;
+      3) echo; svc stop; pause ;;
       4) echo; svc restart; pause ;;
-      5) journalctl -u "$SVC" -n 50 -f || true ;;
+      5) compose logs -n 50 -f turn || true ;;
       6) menu_autostart ;;
-      7) "${PAGER:-less}" "$CONF" ;;
-      8) echo; echo "当前活跃连接:$(conns_now)(需 sudo 才准)"; pause ;;
-      0|q|Q) echo "再见 👋"; exit 0 ;;
+      7) show_conf ;;
+      8) echo; echo "当前活跃连接:$(conns_now)"; pause ;;
+      9) echo; do_init; pause ;;
+      10) echo; do_update; pause ;;
+      11) echo; show_worker; pause ;;
+      0 | q | Q) echo "再见 👋"; exit 0 ;;
       *) echo "无效选择"; sleep 1 ;;
     esac
   done
@@ -111,14 +277,17 @@ run_menu() {
 # ---------- 入口 ----------
 
 case "${1:-menu}" in
-  menu)    run_menu ;;
-  status)  show_status ;;
-  start|stop|restart|reload) svc "$1" ;;
-  on|off)  svc "$1" ;;
-  log)     journalctl -u "$SVC" -n 100 -f ;;
-  conf)    "${PAGER:-less}" "$CONF" ;;
+  menu) run_menu ;;
+  init) do_init ;;
+  status) show_status ;;
+  start | stop | restart | reload) svc "$1" ;;
+  on | off) svc "$1" ;;
+  log) compose logs -n 100 -f turn ;;
+  conf) show_conf ;;
+  update) do_update ;;
+  worker) show_worker ;;
   *)
     echo "用法:party            # 交互菜单"
-    echo "      party <status|start|stop|restart|reload|on|off|log|conf>"
+    echo "      party <init|status|start|stop|restart|reload|on|off|log|conf|update|worker>"
     exit 1 ;;
 esac
