@@ -217,12 +217,8 @@ export default {
 
       // 频道密码校验(owner/admin 免密):不通过直接拒绝升级,改前端也绕不过
       const guildDO = env.GUILD.get(env.GUILD.idFromName('global'));
-      const pw = url.searchParams.get('pw') || '';
-      // 带密码的升级也算一次密码尝试,和 /verify 共用额度,防止绕过 /verify 直接用 WS 爆破
-      if (pw && (await overLimit(env.AUTH_LIMITER, `chpw:${user.username}:${wsMatch[1]}`))) {
-        return new Response('too many attempts', { status: 429 });
-      }
-      const allowed = await guildDO.canEnter(wsMatch[1], user.username, pw);
+      // 只带 /verify 签发的通行凭证(?t=),密码本身不进 URL;凭证是 HMAC 签名,无法爆破
+      const allowed = await guildDO.canEnter(wsMatch[1], user.username, url.searchParams.get('t') || '');
       if (!allowed) return new Response('channel password required', { status: 403 });
 
       const headers = new Headers(request.headers);
@@ -329,8 +325,8 @@ export default {
     if (verifyMatch && method === 'POST') {
       const chId = decodeURIComponent(verifyMatch[1]);
       if (await overLimit(env.AUTH_LIMITER, `chpw:${user.username}:${chId}`)) return tooMany();
-      const ok = await guild.canEnter(chId, user.username, String((await body()).password || ''));
-      return ok ? Response.json({ ok: true }) : Response.json({ error: '频道密码错误' }, { status: 403 });
+      const r = await guild.verifyChannelPassword(chId, user.username, String((await body()).password || '').trim());
+      return r.ok ? Response.json({ ok: true, ticket: r.ticket }) : Response.json({ error: '频道密码错误' }, { status: 403 });
     }
 
     // 频道
@@ -345,8 +341,9 @@ export default {
       if (method === 'DELETE') return done(await guild.deleteChannel(id));
     }
 
-    // 成员与角色(合并账号列表 + 服务器角色)
+    // 成员与角色(合并账号列表 + 服务器角色):只给 owner/admin 看,不向普通成员和游客暴露账号列表
     if (url.pathname === '/api/members' && method === 'GET') {
+      if (!canManage) return forbidden();
       const users = await auth.listUsers();
       const roles = await guild.allRoles();
       return Response.json({ members: users.map((u) => ({ ...u, role: roles[u.username] || 'member' })) });
@@ -612,6 +609,20 @@ export class Auth extends DurableObject {
 // ---------- 服务器(单例):分类 / 频道 / 成员角色(SQLite) ----------
 
 const CHANNEL_TYPES = ['voice', 'text'];
+// 频道密码只存 PBKDF2 哈希:"pbkdf2$<salt>$<hash>"
+const CHANNEL_PW_PREFIX = 'pbkdf2$';
+async function hashChannelPw(pw) {
+  const { salt, hash } = await hashPassword(pw);
+  return `${CHANNEL_PW_PREFIX}${salt}$${hash}`;
+}
+async function checkChannelPw(pw, stored) {
+  if (!stored.startsWith(CHANNEL_PW_PREFIX)) return false;
+  const [salt, hash] = stored.slice(CHANNEL_PW_PREFIX.length).split('$');
+  return verifyPassword(pw, salt, hash);
+}
+// 频道通行凭证有效期:密码校验通过后签发,WS 连接只带凭证不带密码
+const CHANNEL_TICKET_TTL_MS = 24 * 60 * 60 * 1000;
+
 // Room 有人时每 ~60s 补报一次人数;超过这个时长没上报的条目视为失效(Room 异常退出没来得及报 0)
 const PRESENCE_TTL_MS = 3 * 60 * 1000;
 const ASSIGNABLE_ROLES = ['admin', 'member'];
@@ -656,6 +667,13 @@ export class Guild extends DurableObject {
       try {
         this.sql.exec("ALTER TABLE channels ADD COLUMN password TEXT NOT NULL DEFAULT ''");
       } catch {}
+      // 迁移:旧库明文频道密码 → PBKDF2 哈希(只处理还不是哈希格式的)
+      const plain = this.sql
+        .exec("SELECT id, password FROM channels WHERE password != '' AND password NOT LIKE ?", CHANNEL_PW_PREFIX + '%')
+        .toArray();
+      for (const ch of plain) {
+        this.sql.exec('UPDATE channels SET password = ? WHERE id = ?', await hashChannelPw(ch.password), ch.id);
+      }
       this.sql.exec(`CREATE TABLE IF NOT EXISTS members (
         username TEXT PRIMARY KEY,
         role TEXT NOT NULL DEFAULT 'member'
@@ -713,14 +731,55 @@ export class Guild extends DurableObject {
     return { guild, categories, channels };
   }
 
-  // 进入频道校验:无密码放行;owner/admin 免密;其余比对密码。
-  // 未登记的房间名放行(保持旧行为,反正那是另一个房间,不构成绕过)。
-  canEnter(channelId, username, pw) {
-    const ch = this.sql.exec('SELECT password FROM channels WHERE id = ?', channelId).toArray()[0];
-    if (!ch || !ch.password) return true;
+  // 凭证签名密钥:首次使用时随机生成并持久化,只存在这个 DO 里
+  async ticketKey() {
+    if (!this.ticketKeyObj) {
+      let hex = await this.ctx.storage.get('ticket_key');
+      if (!hex) {
+        hex = bytesToHex(crypto.getRandomValues(new Uint8Array(32)));
+        await this.ctx.storage.put('ticket_key', hex);
+      }
+      this.ticketKeyObj = await crypto.subtle.importKey('raw', hexToBytes(hex), { name: 'HMAC', hash: 'SHA-256' }, false, [
+        'sign',
+        'verify',
+      ]);
+    }
+    return this.ticketKeyObj;
+  }
+
+  // 签名内容带上当前密码哈希:管理员一改密码,旧凭证自动全部失效
+  ticketPayload(channelId, username, exp, pwStored) {
+    return new TextEncoder().encode(`${channelId}|${username}|${exp}|${pwStored}`);
+  }
+
+  channelPwOf(channelId) {
+    return this.sql.exec('SELECT password FROM channels WHERE id = ?', channelId).toArray()[0]?.password || '';
+  }
+
+  isManager(username) {
     const role = this.roleOf(username);
-    if (role === 'owner' || role === 'admin') return true;
-    return String(pw) === ch.password;
+    return role === 'owner' || role === 'admin';
+  }
+
+  // 校验频道密码:通过则签发通行凭证 "<过期时间>.<HMAC>",供 WS 升级使用
+  async verifyChannelPassword(channelId, username, pw) {
+    const stored = this.channelPwOf(channelId);
+    if (stored && !this.isManager(username) && !(await checkChannelPw(String(pw), stored))) return { ok: false };
+    if (!stored) return { ok: true, ticket: '' };
+    const exp = Date.now() + CHANNEL_TICKET_TTL_MS;
+    const sig = await crypto.subtle.sign('HMAC', await this.ticketKey(), this.ticketPayload(channelId, username, exp, stored));
+    return { ok: true, ticket: `${exp}.${bytesToHex(new Uint8Array(sig))}` };
+  }
+
+  // 进入频道校验:无密码放行;owner/admin 免密;其余校验通行凭证(未过期、签名对、密码没改过)。
+  // 未登记的房间名放行(保持旧行为,反正那是另一个房间,不构成绕过)。
+  async canEnter(channelId, username, ticket) {
+    const stored = this.channelPwOf(channelId);
+    if (!stored || this.isManager(username)) return true;
+    const m = /^(\d{1,15})\.([0-9a-f]{64})$/.exec(String(ticket || ''));
+    if (!m || Number(m[1]) < Date.now()) return false;
+    // subtle.verify 内部是常量时间比较
+    return crypto.subtle.verify('HMAC', await this.ticketKey(), hexToBytes(m[2]), this.ticketPayload(channelId, username, m[1], stored));
   }
 
   updateGuild({ name, icon, description, clearKbps, smoothKbps, guestKbps } = {}) {
@@ -767,7 +826,7 @@ export class Guild extends DurableObject {
     return { ok: true };
   }
 
-  createChannel({ name, type, categoryId, password } = {}) {
+  async createChannel({ name, type, categoryId, password } = {}) {
     const n = String(name || '').trim().slice(0, 24);
     if (!n) return { ok: false, status: 400, error: '频道名不能为空' };
     const t = CHANNEL_TYPES.includes(type) ? type : 'voice';
@@ -777,12 +836,12 @@ export class Guild extends DurableObject {
     const pos = this.sql.exec('SELECT COALESCE(MAX(position), -1) + 1 AS p FROM channels').toArray()[0]?.p || 0;
     this.sql.exec(
       'INSERT INTO channels (id, category_id, name, type, password, position) VALUES (?, ?, ?, ?, ?, ?)',
-      id, cat, n, t, String(password || '').slice(0, 64), pos,
+      id, cat, n, t, password ? await hashChannelPw(String(password).slice(0, 64)) : '', pos,
     );
     return { ok: true, id };
   }
 
-  updateChannel(id, { name, topic, categoryId, position, password } = {}) {
+  async updateChannel(id, { name, topic, categoryId, position, password } = {}) {
     if (!this.sql.exec('SELECT id FROM channels WHERE id = ?', id).toArray().length)
       return { ok: false, status: 404, error: '频道不存在' };
     if (name !== undefined) {
@@ -792,7 +851,10 @@ export class Guild extends DurableObject {
     }
     if (topic !== undefined) this.sql.exec('UPDATE channels SET topic = ? WHERE id = ?', String(topic).slice(0, 120), id);
     // 空字符串 = 清除密码
-    if (password !== undefined) this.sql.exec('UPDATE channels SET password = ? WHERE id = ?', String(password).slice(0, 64), id);
+    if (password !== undefined) {
+      const pw = String(password).slice(0, 64);
+      this.sql.exec('UPDATE channels SET password = ? WHERE id = ?', pw ? await hashChannelPw(pw) : '', id);
+    }
     if (categoryId !== undefined) {
       let cat = categoryId ? String(categoryId) : null;
       if (cat && !this.sql.exec('SELECT id FROM categories WHERE id = ?', cat).toArray().length) cat = null;

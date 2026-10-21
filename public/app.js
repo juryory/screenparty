@@ -29,7 +29,7 @@ const state = {
   screenStream: null,
   camStream: null,
   presence: {}, // channelId -> 当前人数(轮询 /api/presence)
-  channelPw: {}, // channelId -> 本次会话里验证过的频道密码(内存缓存,重进免输)
+  channelTicket: {}, // channelId -> 密码校验通过后服务端签发的通行凭证(内存缓存,重进/重连免输;不存密码本身)
   peers: new Map(), // id -> { name, sharing, camera, pc, senders, tile, camTile, videoStream, camStream, audioEl, sendQuality, viewReq }
   focusedId: null,  // 当前主舞台显示谁:peer id / id+':cam' / 'local' / 'local:cam' / null
 };
@@ -309,7 +309,7 @@ function channelItem(ch) {
 
 // 带锁频道:普通成员先验密码(owner/admin 免密,服务端同样放行)
 function tryJoinChannel(ch) {
-  if (!ch.hasPassword || canManage() || state.channelPw[ch.id]) {
+  if (!ch.hasPassword || canManage() || state.channelTicket[ch.id]) {
     return joinChannel(ch.id, ch.name, ch.topic);
   }
   const input = textInput('', '频道密码', 64);
@@ -320,7 +320,7 @@ function tryJoinChannel(ch) {
     const pw = input.value;
     const r = await api('POST', `/api/channels/${ch.id}/verify`, { password: pw });
     if (!r.ok) return (alert(r.error || '密码错误'), false);
-    state.channelPw[ch.id] = pw;
+    state.channelTicket[ch.id] = r.data.ticket;
     joinChannel(ch.id, ch.name, ch.topic);
   }, '进入');
 }
@@ -489,9 +489,9 @@ async function acquireMic() {
 
 function connectSignaling() {
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-  const pw = state.channelPw[state.channelId];
+  const ticket = state.channelTicket[state.channelId];
   const ws = new WebSocket(
-    `${proto}://${location.host}/ws/${encodeURIComponent(state.channelId)}${pw ? `?pw=${encodeURIComponent(pw)}` : ''}`,
+    `${proto}://${location.host}/ws/${encodeURIComponent(state.channelId)}${ticket ? `?t=${encodeURIComponent(ticket)}` : ''}`,
   );
   state.ws = ws;
 
@@ -547,11 +547,11 @@ function connectSignaling() {
     stopHeartbeat();
     // 同账号在别处进了频道,本连接被服务器顶掉:退出本地频道状态
     if (e.reason === 'replaced') return leaveChannel();
-    // 从未收到 welcome 就被关 = 连接被拒(如密码已被管理员改掉):清缓存退出
+    // 从未收到 welcome 就被关 = 连接被拒(密码被管理员改掉 / 凭证过期):清缓存退出
     if (!state.myId && state.channelId) {
-      delete state.channelPw[state.channelId];
+      delete state.channelTicket[state.channelId];
       leaveChannel();
-      alert('进入频道失败,密码可能已更改,请重试');
+      alert('进入频道失败,密码可能已更改或验证已过期,请重新输入');
       return;
     }
     // 意外断线(网络波动 / 被服务器判超时):自动重连本频道

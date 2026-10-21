@@ -37,7 +37,7 @@ wrangler deploy                       # 重新部署使其生效
 
 - **本地开发**(可选,与上面互不影响):`wrangler secret put` 只作用于线上部署;本地 `npm run dev` 读不到线上 secret,需另外复制 `.dev.vars.example` 为 `.dev.vars`(已被 `.gitignore` 忽略,不会提交)填好同名变量。只部署不本地开发的话跳过这条。可选 `GUILD_NAME` 设置服务器显示名。
 - **角色与权限**:`ADMIN_USERNAME` 是服务器**所有者**(唯一,可任命管理员);**管理员**能建/改/删频道分类、改服务器信息;**成员**只能进频道开黑。角色在网页左下用户面板 → 设置,或服务器名旁的 ⌄ 菜单 →「成员与角色」里管理(仅所有者可改)。
-- **频道管理**:所有者/管理员在频道名上 hover 出现 `⋯`,或用服务器 ⌄ 菜单新建频道/分类、编辑、删除。可给频道**设置密码**(新建/编辑弹窗里填):成员进入时需输入密码,owner/admin 免密;校验在服务端 WebSocket 升级时强制执行。
+- **频道管理**:所有者/管理员在频道名上 hover 出现 `⋯`,或用服务器 ⌄ 菜单新建频道/分类、编辑、删除。可给频道**设置密码**(新建/编辑弹窗里填):成员进入时需输入密码,owner/admin 免密。频道密码只存 PBKDF2 哈希;校验通过后服务端签发 24 小时有效的通行凭证,WebSocket 连接只带凭证不带密码,改密码后旧凭证立即失效。
 - **管理其他账号**:用管理员登录后,左下用户面板 → 设置齿轮 →「用户管理」进入 `/admin.html`,可**新增 / 改昵称 / 重置密码 / 启用停用 / 删除**普通用户。删除账号会同时清掉其服务器角色,之后有人注册同名账号也只是普通成员。
 - **安全说明**:密码仅以 PBKDF2 加盐哈希存储(不留明文),会话走 `HttpOnly; Secure` Cookie;停用或删除用户会立即使其在线会话失效。管理员账号一旦创建,改密走管理界面,再改环境变量不会覆盖已有账号。
 - **限流**:登录每 IP、每用户名每分钟各 10 次;注册 / 游客进入每 IP 每分钟合计 5 次;频道密码尝试每人每频道每分钟 10 次。超限返回 429「操作太频繁」。阈值在 `wrangler.jsonc` 的 `ratelimits` 里改(Workers Rate Limiting,按边缘节点近似计数)。
@@ -100,14 +100,23 @@ no-cli
 no-tcp-relay
 # 收敛滥用面:禁止被拿去中继内网 / 云元数据
 no-multicast-peers
+denied-peer-ip=0.0.0.0-0.255.255.255
 denied-peer-ip=10.0.0.0-10.255.255.255
-denied-peer-ip=192.168.0.0-192.168.255.255
+denied-peer-ip=100.64.0.0-100.127.255.255
+denied-peer-ip=127.0.0.0-127.255.255.255
 denied-peer-ip=169.254.0.0-169.254.255.255
+denied-peer-ip=172.16.0.0-172.31.255.255
+denied-peer-ip=192.168.0.0-192.168.255.255
+denied-peer-ip=::1
+denied-peer-ip=fc00::-fdff:ffff:ffff:ffff:ffff:ffff:ffff:ffff
+denied-peer-ip=fe80::-febf:ffff:ffff:ffff:ffff:ffff:ffff:ffff
 EOF
 echo "==== 下面两个值第 6 步要填到 Worker,记下来 ===="
 echo "COTURN_SECRET = $SECRET"
 echo "COTURN_HOST   = $PUBLIC_IP"
 ```
+
+> **按旧版教程装过的**:旧配置漏了 `172.16.0.0/12`(很多云内网)、`100.64.0.0/10`(腾讯云等内网/CGNAT)和回环、IPv6 内网段,拿到凭证的人可借中继访问你 VPS 所在内网。把上面整组 `denied-peer-ip=` 行替换进 `/etc/turnserver.conf`,再 `sudo systemctl restart coturn` 即可。
 
 **第 3 步 · 放行端口(两层都要,少一层就连不上)**
 - **腾讯云控制台 → 安全组 → 入站规则**:
