@@ -53,6 +53,17 @@ const TRADEOFFS = [
   { label: '极致流畅', pref: 'maintain-framerate', fps: 30, maxH: 720 },
 ];
 
+// 调试模式:地址加 ?debug=1 开启(记在本机,?debug=0 关闭),画面角标显示 <video> 的完整播放状态
+const DEBUG = (() => {
+  try {
+    const q = new URLSearchParams(location.search).get('debug');
+    if (q !== null) localStorage.setItem('sp-debug', q === '1' ? '1' : '');
+    return localStorage.getItem('sp-debug') === '1';
+  } catch {
+    return false;
+  }
+})();
+
 // ---------- Safari 自动播放兜底 ----------
 // Safari 拦截带声 autoplay(play() 拒绝后连画面都不解码,表现为黑屏)。
 // 兜底:被拒就先静音播出画面,等用户下一次点击页面(Safari 认的手势)统一解除静音重播。
@@ -1206,6 +1217,18 @@ function makePlaceholder(name, key) {
 
 // ---------- 实时统计(分辨率 / fps / 码率) ----------
 
+// 调试信息:元素播放状态 / 尺寸 / 轨道状态 / 解码与丢帧,用于定位"有解码无画面"
+function videoDebug(v, s) {
+  const tracks = (v.srcObject?.getTracks() || []).map((t) => `${t.kind[0]}:${t.readyState}${t.muted ? '/muted' : ''}${t.enabled ? '' : '/off'}`);
+  return [
+    `paused=${v.paused} muted=${v.muted} rs=${v.readyState} t=${v.currentTime.toFixed(1)}`,
+    `video=${v.videoWidth}×${v.videoHeight} box=${v.clientWidth}×${v.clientHeight}`,
+    `tracks ${tracks.join(' ') || '无'}`,
+    `dec=${s.framesDecoded ?? '?'} drop=${s.framesDropped ?? '?'} codec=${s.decoderImplementation || '?'}`,
+    `ua=${/iPhone|iPad|Macintosh/.exec(navigator.userAgent)?.[0] || '?'} ${innerWidth}×${innerHeight}`,
+  ].join('\n');
+}
+
 function startStatsLoop() {
   const last = new Map(); // peerId+mid / 'local' -> bytes
   setInterval(async () => {
@@ -1235,7 +1258,8 @@ function startStatsLoop() {
               statsEl.textContent =
                 `${s.frameWidth || '?'}×${s.frameHeight || '?'} ` +
                 `${s.framesPerSecond || 0}fps ${kbps}kbps` +
-                (paused ? ' ⏸点画面播放' : blank ? ' ·未渲染' : '');
+                (paused ? ' ⏸点画面播放' : blank ? ' ·未渲染' : '') +
+                (DEBUG && v ? '\n' + videoDebug(v, s) : '');
             // 渲染自愈:连续 2 轮(~4s)在解码但 <video> 暂停或没画面 → 重挂流并重新播放
             if (v && decoding && (paused || blank || v.readyState < 2)) {
               const n = (p.renderTicks?.[decKey] || 0) + 1;
