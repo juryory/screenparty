@@ -611,6 +611,8 @@ export class Auth extends DurableObject {
 // ---------- 服务器(单例):分类 / 频道 / 成员角色(SQLite) ----------
 
 const CHANNEL_TYPES = ['voice', 'text'];
+// 中继模式,下标即 guild.force_relay 存储值
+const RELAY_MODES = ['auto', 'force', 'off'];
 // 频道密码只存 PBKDF2 哈希:"pbkdf2$<salt>$<hash>"
 const CHANNEL_PW_PREFIX = 'pbkdf2$';
 async function hashChannelPw(pw) {
@@ -644,7 +646,7 @@ export class Guild extends DurableObject {
         clear_kbps  INTEGER NOT NULL DEFAULT 2500,
         smooth_kbps INTEGER NOT NULL DEFAULT 1500,
         guest_kbps  INTEGER NOT NULL DEFAULT 800,
-        force_relay INTEGER NOT NULL DEFAULT 0
+        force_relay INTEGER NOT NULL DEFAULT 0 -- 中继模式:0 自动 / 1 强制中继 / 2 关闭中继(列名沿用旧的布尔开关)
       )`);
       // 迁移:旧库补画质档码率列(新库建表已含,ALTER 抛错跳过)
       for (const col of ['clear_kbps INTEGER NOT NULL DEFAULT 2500', 'smooth_kbps INTEGER NOT NULL DEFAULT 1500', 'guest_kbps INTEGER NOT NULL DEFAULT 800', 'force_relay INTEGER NOT NULL DEFAULT 0']) {
@@ -724,8 +726,9 @@ export class Guild extends DurableObject {
       description: g.description,
       // 共享画质档码率(kbps):高清固定 3500,清晰/流畅/游客 由管理员可配
       quality: { clear: g.clear_kbps ?? 2500, smooth: g.smooth_kbps ?? 1500, guest: g.guest_kbps ?? 800 },
-      // 强制所有连接走 TURN 中继(不尝试 P2P 直连)
-      forceRelay: !!g.force_relay,
+      // TURN 中继模式:auto 直连失败才中继 / force 全部走中继 / off 不用中继(仅 P2P)
+      relayMode: RELAY_MODES[g.force_relay] || 'auto',
+      forceRelay: g.force_relay === 1, // 兼容旧版前端
     };
     const categories = this.sql.exec('SELECT id, name, position FROM categories ORDER BY position, name').toArray();
     const channels = this.sql
@@ -787,7 +790,7 @@ export class Guild extends DurableObject {
     return crypto.subtle.verify('HMAC', await this.ticketKey(), hexToBytes(m[2]), this.ticketPayload(channelId, username, m[1], stored));
   }
 
-  updateGuild({ name, icon, description, clearKbps, smoothKbps, guestKbps, forceRelay } = {}) {
+  updateGuild({ name, icon, description, clearKbps, smoothKbps, guestKbps, relayMode, forceRelay } = {}) {
     if (name !== undefined) {
       const n = String(name).trim().slice(0, 32);
       if (!n) return { ok: false, status: 400, error: '服务器名不能为空' };
@@ -800,7 +803,14 @@ export class Guild extends DurableObject {
     if (clearKbps !== undefined) this.sql.exec('UPDATE guild SET clear_kbps = ? WHERE id = 1', clampKbps(clearKbps));
     if (smoothKbps !== undefined) this.sql.exec('UPDATE guild SET smooth_kbps = ? WHERE id = 1', clampKbps(smoothKbps));
     if (guestKbps !== undefined) this.sql.exec('UPDATE guild SET guest_kbps = ? WHERE id = 1', clampKbps(guestKbps));
-    if (forceRelay !== undefined) this.sql.exec('UPDATE guild SET force_relay = ? WHERE id = 1', forceRelay ? 1 : 0);
+    if (relayMode !== undefined) {
+      const m = RELAY_MODES.indexOf(relayMode);
+      if (m < 0) return { ok: false, status: 400, error: '中继模式只能是 auto / force / off' };
+      this.sql.exec('UPDATE guild SET force_relay = ? WHERE id = 1', m);
+    } else if (forceRelay !== undefined) {
+      // 旧版前端只有布尔开关
+      this.sql.exec('UPDATE guild SET force_relay = ? WHERE id = 1', forceRelay ? 1 : 0);
+    }
     return { ok: true };
   }
 

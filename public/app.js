@@ -626,7 +626,7 @@ function sendSignal(to, data) {
 
 function createPeerConnection(peerId) {
   const peer = state.peers.get(peerId);
-  const pc = new RTCPeerConnection({ iceServers: state.iceServers, iceTransportPolicy: relayPolicy() });
+  const pc = new RTCPeerConnection(iceConfig());
   peer.pc = pc;
   peer.videoStream = new MediaStream();
   peer.camStream = new MediaStream();
@@ -737,11 +737,17 @@ async function doIceRestart(peerId) {
   } catch {}
 }
 
-// 服务器开了「强制中继」且确实拿到了 TURN 凭证 → 只用 relay 候选;
-// 没有 TURN 时退回 all,否则只剩 relay 候选会谁都连不上
-function relayPolicy() {
-  const hasTurn = state.iceServers.some((s) => [].concat(s.urls).some((u) => /^turns?:/.test(u)));
-  return state.guild?.guild?.forceRelay && hasTurn ? 'relay' : 'all';
+// 按服务器的中继模式生成 PeerConnection 配置:
+//   force → 只用 relay 候选(确实拿到 TURN 凭证时;没有 TURN 退回 all,否则谁都连不上)
+//   off   → 去掉 TURN 服务器,只留 STUN,只走 P2P 直连
+//   auto  → STUN + TURN,直连失败自动回落中继
+function iceConfig() {
+  const isTurn = (s) => [].concat(s.urls).some((u) => /^turns?:/.test(u));
+  const g = state.guild?.guild || {};
+  const mode = g.relayMode || (g.forceRelay ? 'force' : 'auto');
+  if (mode === 'off') return { iceServers: state.iceServers.filter((s) => !isTurn(s)) };
+  const relay = mode === 'force' && state.iceServers.some(isTurn);
+  return { iceServers: state.iceServers, iceTransportPolicy: relay ? 'relay' : 'all' };
 }
 
 function setupTransceivers(pc, asOfferer) {
@@ -1300,7 +1306,13 @@ function startStatsLoop() {
           const lc = stats.get(pair.localCandidateId) || {};
           const rc = stats.get(pair.remoteCandidateId) || {};
           isRelay = lc.candidateType === 'relay' || rc.candidateType === 'relay';
-          route = isRelay ? 'TURN中继' : 'P2P直连';
+          // 直连时标出 IPv4 / IPv6(按选中候选对的实际地址;mDNS 匿名名或拿不到地址时不标)
+          const ipv = (c) => {
+            const a = c.address || c.ip || '';
+            return a.endsWith('.local') ? '' : a.includes(':') ? 'IPv6' : /^\d+\.\d+\.\d+\.\d+$/.test(a) ? 'IPv4' : '';
+          };
+          const ver = ipv(lc) || ipv(rc);
+          route = isRelay ? 'TURN中继' : ver ? `P2P直连·${ver}` : 'P2P直连';
         }
         for (const t of [p.tile, p.camTile]) {
           const el = t?.querySelector('.tile-route');
@@ -1513,19 +1525,33 @@ function openServerSettings() {
   const clear = numInput(q.clear);
   const smooth = numInput(q.smooth);
   const guest = numInput(q.guest);
-  // 强制中继开关:没配置 TURN 时禁用(开了也无效)
-  const relay = document.createElement('input');
-  relay.type = 'checkbox';
-  relay.checked = !!g.forceRelay;
-  relay.disabled = !state.guild.relayAvailable && !g.forceRelay;
-  const relayLabel = document.createElement('label');
-  relayLabel.className = 'field field-check';
-  relayLabel.append(relay, ' 所有连接强制走 TURN 中继(不尝试 P2P 直连)');
+  // TURN 中继模式:自动 / 强制 / 关闭。没配置 TURN 时「强制」不可选
+  const relay = document.createElement('select');
+  relay.className = 'field-input';
+  const RELAY_NOTES = {
+    auto: '优先 P2P 直连,直连失败的成员之间自动改走 TURN 中继。',
+    force: '画面和语音全部经 TURN 服务器转发:占用服务器带宽/流量,延迟略增,适合 P2P 线路差的情况。',
+    off: '只走 P2P 直连,完全不用 TURN 服务器;打洞失败的成员之间会连不上。',
+  };
+  for (const [val, label] of [['auto', '自动(推荐)'], ['force', '强制走中继'], ['off', '关闭中继(仅 P2P 直连)']]) {
+    const o = document.createElement('option');
+    o.value = val;
+    o.textContent = label;
+    if (val === 'force' && !state.guild.relayAvailable) o.disabled = true;
+    relay.append(o);
+  }
+  relay.value = g.relayMode || (g.forceRelay ? 'force' : 'auto');
   const relayNote = document.createElement('p');
   relayNote.className = 'field-note';
-  relayNote.textContent = state.guild.relayAvailable
-    ? '画面和语音全部经你的 TURN 服务器转发,会占用服务器带宽/流量,延迟略增。保存后,每个人下次进入频道时生效。'
-    : '未配置 TURN 服务器(COTURN_* 或 TURN_KEY_*),无法开启。';
+  const showRelayNote = () => {
+    relayNote.textContent =
+      RELAY_NOTES[relay.value] +
+      (state.guild.relayAvailable ? '' : '(未配置 TURN 服务器 COTURN_* / TURN_KEY_*,无法强制中继。)') +
+      ' 保存后,每个人下次进入频道时生效。';
+  };
+  relay.addEventListener('change', showRelayNote);
+  showRelayNote();
+  const relayLabel = field('TURN 中继', relay);
   const note = document.createElement('p');
   note.className = 'field-note';
   note.textContent = '各档「码率上限(kbps)」,分辨率由编码器按码率自动决定。高清档固定 3.5Mbps;以下三档可调:';
@@ -1550,7 +1576,7 @@ function openServerSettings() {
       clearKbps: +clear.value,
       smoothKbps: +smooth.value,
       guestKbps: +guest.value,
-      forceRelay: relay.checked,
+      relayMode: relay.value,
     });
     if (!r.ok) return (alert(r.error || '保存失败'), false);
     await loadGuild();
