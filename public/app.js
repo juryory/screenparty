@@ -75,6 +75,8 @@ document.addEventListener(
       el.play().catch(() => {});
     }
     pendingUnmute.clear();
+    // 静音后仍被拦下(iOS 低电量模式等)的画面:借这次点击手势一并播起来
+    for (const v of document.querySelectorAll('.tile video')) if (v.paused) v.play().catch(() => {});
   },
   true
 );
@@ -1221,11 +1223,32 @@ function startStatsLoop() {
             const delta = s.bytesReceived - prev;
             const kbps = Math.round((delta * 8) / 2000);
             last.set(key, s.bytesReceived);
+            const decKey = key + ':dec';
+            const decoding = (s.framesDecoded || 0) > (last.get(decKey) || 0);
+            last.set(decKey, s.framesDecoded || 0);
+            const v = tile?.querySelector('video');
+            // 画面状态诊断:在解码却没画面 = 渲染侧问题(iOS 常见:播放被暂停 / 流没刷新到 <video>)
+            const paused = !!v && v.paused;
+            const blank = !!v && !v.videoWidth;
             const statsEl = tile?.querySelector('.tile-stats');
             if (statsEl)
               statsEl.textContent =
                 `${s.frameWidth || '?'}×${s.frameHeight || '?'} ` +
-                `${s.framesPerSecond || 0}fps ${kbps}kbps`;
+                `${s.framesPerSecond || 0}fps ${kbps}kbps` +
+                (paused ? ' ⏸点画面播放' : blank ? ' ·未渲染' : '');
+            // 渲染自愈:连续 2 轮(~4s)在解码但 <video> 暂停或没画面 → 重挂流并重新播放
+            if (v && decoding && (paused || blank || v.readyState < 2)) {
+              const n = (p.renderTicks?.[decKey] || 0) + 1;
+              p.renderTicks = { ...p.renderTicks, [decKey]: n };
+              if (n >= 2) {
+                p.renderTicks[decKey] = 0;
+                v.srcObject = null;
+                v.srcObject = isCam ? p.camStream : p.videoStream;
+                safePlay(v);
+              }
+            } else if (p.renderTicks?.[decKey]) {
+              p.renderTicks[decKey] = 0;
+            }
             // 卡死自愈兜底:对方在共享屏幕却连续多轮零字节(ICE 仍显示 connected 的僵死),强制重连
             if (!isCam && p.sharing) {
               if (delta <= 0) {
