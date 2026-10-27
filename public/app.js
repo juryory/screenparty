@@ -823,9 +823,21 @@ function sendPublish() {
 function wantRid(peerId) {
   return state.focusedId === peerId ? (state.isGuest ? 'h' : 'f') : 'q';
 }
+// 降层策略跟随我自己的「质量-速度」滑杆:
+//   偏质量(0~2):priorityOrdering none — SFU 估计我下行不够时也坚持发首选层,宁可卡一下也不糊
+//   偏速度(3~4):asciibetical — 带宽不够就按 f→h→q 自动降层,宁可糊也不卡
+// 发布方暂停了首选层(其上行不够)时都按 f→h→q 找替代(ridNotAvailable),否则会直接黑屏
 function simulcastFor(peerId) {
-  // asciibetical:带宽不够时按 f→h→q 顺序自动降层,发布方没发某层时也按此顺序找替代
-  return { preferredRid: wantRid(peerId), priorityOrdering: 'asciibetical', ridNotAvailable: 'asciibetical' };
+  return {
+    preferredRid: wantRid(peerId),
+    priorityOrdering: state.tradeoff <= 2 ? 'none' : 'asciibetical',
+    ridNotAvailable: 'asciibetical',
+  };
+}
+// 订阅当前生效的选层设置,变了就要 tracks/update
+function simKey(peerId) {
+  const c = simulcastFor(peerId);
+  return `${c.preferredRid}/${c.priorityOrdering}`;
 }
 
 // 期望的订阅集合:房间里每个人公布的每条轨道
@@ -887,7 +899,7 @@ async function reconcileSubs(conn) {
       if (t.errorCode || !t.mid) continue;
       const w = add.find((a) => a.trackName === t.trackName && a.sessionId === t.sessionId);
       if (!w) continue;
-      const s = { ...w, mid: t.mid, rid: w.kind === 'screen' ? wantRid(w.peerId) : null };
+      const s = { ...w, mid: t.mid, rid: w.kind === 'screen' ? wantRid(w.peerId) : null, sim: w.kind === 'screen' ? simKey(w.peerId) : null };
       sfu.subs.set(s.key, s);
       sfu.byMid.set(s.mid, s);
     }
@@ -895,12 +907,15 @@ async function reconcileSubs(conn) {
   }
 
   // 3. 屏幕清晰度层随焦点切换
-  const ups = [...sfu.subs.values()].filter((s) => s.kind === 'screen' && s.rid !== wantRid(s.peerId));
+  const ups = [...sfu.subs.values()].filter((s) => s.kind === 'screen' && s.sim !== simKey(s.peerId));
   if (ups.length) {
     const res = await conn.call('update', {
       tracks: ups.map((s) => ({ location: 'remote', sessionId: s.sessionId, trackName: s.trackName, mid: s.mid, simulcast: simulcastFor(s.peerId) })),
     });
-    ups.forEach((s) => (s.rid = wantRid(s.peerId)));
+    ups.forEach((s) => {
+      s.rid = wantRid(s.peerId);
+      s.sim = simKey(s.peerId);
+    });
     if (res.requiresImmediateRenegotiation && res.sessionDescription) await answerSfuOffer(conn, res.sessionDescription);
   }
 }
@@ -1064,7 +1079,8 @@ function setTradeoff(v) {
   state.tradeoff = v;
   try { localStorage.setItem('sp-tradeoff', String(v)); } catch {}
   $('tradeoffBox').title = `带宽/性能不够时的取舍:${TRADEOFFS[v].label}`;
-  applyScreenParams();
+  applyScreenParams(); // 我作为共享者的编码取舍
+  updateViewQuality(); // 我作为观看者的降层策略
 }
 
 // 切换共享清晰度档(共享中立即生效)
@@ -1295,7 +1311,7 @@ function setFocus(key) {
 // 我在看谁 → 主窗口那路切到原画层,其余切到缩略图层(省下行带宽);实际切换在订阅同步里做
 function updateViewQuality() {
   for (const s of sfu.subs.values()) {
-    if (s.kind === 'screen' && s.rid !== wantRid(s.peerId)) return syncSubscriptions();
+    if (s.kind === 'screen' && s.sim !== simKey(s.peerId)) return syncSubscriptions();
   }
 }
 
@@ -1378,11 +1394,14 @@ function startStatsLoop() {
           const paused = !!v && v.paused;
           const blank = !!v && !v.videoWidth;
           const layer = !isCam && sub.rid ? ` [${{ f: '原画', h: '中', q: '缩略' }[sub.rid]}]` : '';
+          // 实际收到的分辨率明显低于这一路见过的最高值 = SFU 因下行带宽给我降了层(或发布方暂停了高层)
+          if (s.frameHeight) sub.maxH = Math.max(sub.maxH || 0, s.frameHeight);
+          const downgraded = !isCam && sub.rid === 'f' && s.frameHeight && s.frameHeight < sub.maxH * 0.8 ? ' ·SFU降档' : '';
           const statsEl = tile?.querySelector('.tile-stats');
           if (statsEl)
             statsEl.textContent =
               `${s.frameWidth || '?'}×${s.frameHeight || '?'} ` +
-              `${s.framesPerSecond || 0}fps ${kbps}kbps${layer}` +
+              `${s.framesPerSecond || 0}fps ${kbps}kbps${layer}${downgraded}` +
               (paused ? ' ⏸点画面播放' : blank ? ' ·未渲染' : '') +
               (DEBUG && v ? '\n' + videoDebug(v, s) : '');
           // 渲染自愈:连续 2 轮(~4s)在解码但 <video> 暂停或没画面 → 重挂流并重新播放
