@@ -1,9 +1,8 @@
-// ScreenParty 前端 — WebRTC full mesh
+// ScreenParty 前端 — Cloudflare Realtime SFU
 //
-// 连接模型:每对成员一条 RTCPeerConnection,固定 4 个 transceiver:
-//   [0] mic 音频  [1] 屏幕视频  [2] 屏幕音频(游戏声)  [3] 摄像头视频
-// 建连时一次性协商好全部 m-line,之后开/关共享只 replaceTrack,不重协商。
-// 新加入者作为发起方,向房间内每个已有成员发 offer,天然无 glare。
+// 连接模型:每人一条上行连接把自己的麦克风/屏幕/摄像头发布到 SFU(屏幕三层 simulcast),
+// 一条下行连接按房间信令里公布的轨道订阅别人。共享者只上传一份,与观看人数无关。
+// 详见下方「Cloudflare Realtime SFU」一节。P2P mesh 版本在 tencent 分支。
 
 'use strict';
 
@@ -30,17 +29,17 @@ const state = {
   camStream: null,
   presence: {}, // channelId -> 当前人数(轮询 /api/presence)
   channelTicket: {}, // channelId -> 密码校验通过后服务端签发的通行凭证(内存缓存,重进/重连免输;不存密码本身)
-  peers: new Map(), // id -> { name, sharing, camera, pc, senders, tile, camTile, videoStream, camStream, audioEl, sendQuality, viewReq }
+  peers: new Map(), // id -> { name, sharing, camera, pub, tile, camTile, videoStream, camStream, screenAudioTrack, audioEl }
   focusedId: null,  // 当前主舞台显示谁:peer id / id+':cam' / 'local' / 'local:cam' / null
 };
 
 const ROLE_LABEL = { owner: '所有者', admin: '管理员', member: '成员' };
 
-const SCREEN_MAX_BITRATE = 3_500_000; // ~3.5 Mbps,主窗口(被人放大观看)的全码率
-const THUMB_MAX_BITRATE = 300_000;    // 缩略图(没在主窗口看的共享)只发 ~300kbps,分辨率随之自动降
+const SCREEN_MAX_BITRATE = 3_500_000; // ~3.5 Mbps,高清档 f 层(主窗口观看)码率
+const THUMB_MAX_BITRATE = 300_000;    // q 层(缩略图)~300kbps
 const CAM_MAX_BITRATE = 1_000_000;    // 摄像头固定 ~1 Mbps(人脸画面不需要屏幕那么高)
 
-// 质量-速度滑杆各档:带宽/CPU 吃紧时编码器怎么退让(只作用于发给主窗口观看者的那一路)
+// 质量-速度滑杆各档:带宽/CPU 吃紧时编码器怎么退让(作用于 f 层,即主窗口观看者收到的那层)
 //   pref   degradationPreference:maintain-resolution 掉帧保分辨率 / balanced 两头都让 /
 //          maintain-framerate 降分辨率保帧率(会 1080→810→540→405 逐级掉,回升慢)
 //   fps    帧率上限:限帧后每帧分到的码率更多,画面更干净
@@ -344,6 +343,10 @@ async function joinChannel(id, name, topic) {
 
   // 每次进频道刷新一次服务器设置:管理员改了「强制中继」等,其他人下次进频道即生效,无需刷新页面
   await loadGuild();
+  if (state.guild && !state.guild.sfuConfigured) {
+    alert('服务器还没配置 Cloudflare Realtime SFU(REALTIME_APP_ID / REALTIME_APP_SECRET),暂时无法进入频道');
+    return;
+  }
   // 没有麦克风时不阻塞:只共享/观看画面、收听别人语音
   if (!state.micTrack) state.micTrack = await acquireMic();
   if (state.iceServers.length <= 1) {
@@ -385,14 +388,9 @@ function leaveChannel(rerender = true) {
     state.camStream = null;
     camUi(false);
   }
-  for (const [, p] of state.peers) {
-    clearTimeout(p.recoverTimer);
-    p.pc?.close();
-    p.audioEl && (p.audioEl.srcObject = null);
-    p.tile?.remove();
-    p.camTile?.remove();
-  }
+  for (const [, p] of state.peers) detachAll(p);
   state.peers.clear();
+  stopMedia(); // SFU 会话不用显式关:连接断开后轨道 30s 无数据即被回收
   localTile?.remove();
   localTile = null;
   localCamTile?.remove();
@@ -523,37 +521,37 @@ function connectSignaling() {
         state.myId = msg.id;
         reconnectDelay = 1000; // 重连成功,退避归位
         $('netStatus').hidden = true;
+        for (const p of msg.peers) addPeer(p);
         renderMembers();
-        // 新人主动向每个已有成员发起连接
-        for (const p of msg.peers) {
-          addPeer(p);
-          await makeOffer(p.id);
+        // 首次进频道:建 SFU 连接并发布麦克风等;信令重连:SFU 连接还在,只需向房间重新报一次发布信息
+        if (!sfu.pub) {
+          startMedia();
+          await publishCurrent();
+        } else {
+          sendPublish();
         }
-        // 重连后服务端把我的共享状态重置了,重新广播一次当前状态
-        if (state.screenStream || state.camStream) {
-          ws.send(JSON.stringify({ type: 'state', sharing: !!state.screenStream, camera: !!state.camStream }));
-        }
+        syncSubscriptions();
         break;
       case 'peer-joined':
-        addPeer(msg.peer); // 被动等待对方的 offer
+        addPeer(msg.peer); // 对方发布轨道后会收到 peer-state,届时再订阅
         blip(true);
         break;
       case 'peer-left':
         removePeer(msg.id);
         blip(false);
+        syncSubscriptions();
         break;
       case 'peer-state': {
         const p = state.peers.get(msg.id);
         if (p) {
           p.sharing = msg.sharing;
           p.camera = !!msg.camera;
+          p.pub = msg.pub || null;
+          syncSubscriptions();
           refreshTiles();
         }
         break;
       }
-      case 'signal':
-        await handleSignal(msg.from, msg.data);
-        break;
     }
   };
 
@@ -590,7 +588,8 @@ function stopHeartbeat() {
 
 let reconnectTimer = null;
 let reconnectDelay = 1000;
-// 断线重连:清掉旧 peer(网络恢复后重新握手),退避重试进入本频道
+// 信令断线重连:成员 id 会重新分配,清掉旧成员(订阅随之在下次同步时关闭),退避重试进入本频道。
+// SFU 媒体连接独立于信令,不受影响。
 function scheduleReconnect() {
   if (!state.channelId) return;
   $('netStatus').hidden = false;
@@ -603,11 +602,9 @@ function scheduleReconnect() {
   }, reconnectDelay);
 }
 
-// 清掉当前所有 peer(重连前),保留本地频道 / 共享状态
+// 清掉当前所有成员(重连前),保留本地频道 / 共享状态
 function resetPeers() {
   for (const [, p] of state.peers) {
-    clearTimeout(p.recoverTimer);
-    p.pc?.close();
     p.audioEl && (p.audioEl.srcObject = null);
     p.tile?.remove();
     p.camTile?.remove();
@@ -618,129 +615,363 @@ function resetPeers() {
   refreshTiles();
 }
 
-function sendSignal(to, data) {
-  state.ws?.send(JSON.stringify({ type: 'signal', to, data }));
+// ---------- Cloudflare Realtime SFU ----------
+//
+// 每人两条 PeerConnection 连到 Cloudflare 边缘:
+//   pub  只发:麦克风 / 屏幕(画面三层 simulcast + 游戏声)/ 摄像头,各自是一个具名轨道
+//   sub  只收:按房间里别人公布的「会话 ID + 轨道名」订阅
+// SFU API 由 Worker 代调(/api/sfu/*,App Secret 不出服务端)。
+// 同一会话的操作必须串行:上一个操作的 SDP 交换完成前不能发起下一个,所以每条连接一个串行队列。
+
+const sfu = {
+  pub: null, // SfuConn
+  sub: null, // SfuConn
+  published: {}, // kind -> { trackName, transceiver }   kind: mic / screen / screenAudio / cam
+  subs: new Map(), // key -> { key, peerId, kind, sessionId, trackName, mid, rid }
+  byMid: new Map(), // 下行连接的 mid -> 订阅,ontrack 据此找到是谁的哪路
+  seq: 0, // 轨道名序号:每次重新共享用新名字,不复用已关闭的轨道
+  syncQueued: false,
+  restarting: false,
+};
+
+// 屏幕三层 simulcast:f 原始/滑杆限定分辨率,h 一半(游客观看),q 缩略图
+const SCREEN_LAYERS = ['f', 'h', 'q'];
+
+class SfuConn {
+  constructor(onTrack) {
+    this.pc = new RTCPeerConnection(iceConfig());
+    this.session = null; // { sessionId, token }
+    this.queue = Promise.resolve();
+    if (onTrack) this.pc.ontrack = onTrack;
+    this.pc.onconnectionstatechange = () => {
+      const st = this.pc.connectionState;
+      clearTimeout(this.lostTimer);
+      if (st === 'failed') restartMedia();
+      else if (st === 'disconnected') this.lostTimer = setTimeout(restartMedia, 5000); // disconnected 常能自愈,先等 5s
+    };
+  }
+  // 串行执行:fn 内的 API 调用 + SDP 交换整体完成后才轮到下一个
+  run(fn) {
+    const p = this.queue.then(fn);
+    this.queue = p.catch(() => {});
+    return p;
+  }
+  async ensureSession() {
+    if (!this.session) this.session = await sfuCall('session', {});
+    return this.session;
+  }
+  call(op, body) {
+    return sfuCall(op, { ...body, sessionId: this.session.sessionId, token: this.session.token });
+  }
+  close() {
+    clearTimeout(this.lostTimer);
+    this.pc.onconnectionstatechange = null;
+    this.pc.ontrack = null;
+    this.pc.close();
+  }
 }
 
-// ---------- WebRTC mesh ----------
-
-function createPeerConnection(peerId) {
-  const peer = state.peers.get(peerId);
-  const pc = new RTCPeerConnection(iceConfig());
-  peer.pc = pc;
-  peer.videoStream = new MediaStream();
-  peer.camStream = new MediaStream();
-
-  pc.onicecandidate = (e) => {
-    if (e.candidate) sendSignal(peerId, { ice: e.candidate });
-  };
-
-  pc.ontrack = (e) => {
-    const idx = pc.getTransceivers().indexOf(e.transceiver);
-
-    // Safari 黑屏修复:对方停止共享→重新共享走的是 replaceTrack,接收端不会再有
-    // ontrack,只是同一条 track 先 muted 再 unmuted。WebKit 对「挂载时还是 muted、
-    // 之后才恢复」的轨道不会自动开始渲染,必须在 unmute(数据恢复)时重挂流强制刷新。
-    if (idx === 1 || idx === 3) {
-      e.track.onunmute = () => {
-        refreshTiles(); // 信令若晚到,先按当前状态补瓦片
-        const tile = idx === 3 ? peer.camTile : peer.tile;
-        const v = tile?.querySelector('video');
-        if (v) {
-          v.srcObject = idx === 3 ? peer.camStream : peer.videoStream;
-          safePlay(v);
-        }
-      };
-    }
-
-    if (idx === 0) {
-      // 对方麦克风
-      peer.audioEl = peer.audioEl || new Audio();
-      peer.audioEl.autoplay = true;
-      peer.audioEl.srcObject = new MediaStream([e.track]);
-      safePlay(peer.audioEl);
-    } else if (idx === 3) {
-      // 对方摄像头
-      peer.camStream.addTrack(e.track);
-      const oldTile = peer.camTile;
-      refreshTiles();
-      if (peer.camTile && peer.camTile === oldTile) {
-        const v = peer.camTile.querySelector('video');
-        if (v) {
-          v.srcObject = peer.camStream;
-          safePlay(v);
-        }
-      }
-    } else {
-      // 对方屏幕(视频 + 游戏声),合入同一条流保证音画同步
-      peer.videoStream.addTrack(e.track);
-      const oldTile = peer.tile;
-      refreshTiles();
-      // WebKit:流挂上 <video> 后再 addTrack 可能不刷新画面;复用旧瓦片时重设 srcObject 兜底
-      // (新建的瓦片 makeTile 里已挂流并 safePlay,无需重复)
-      if (peer.tile && peer.tile === oldTile) {
-        const v = peer.tile.querySelector('video');
-        if (v) {
-          v.srcObject = peer.videoStream;
-          safePlay(v);
-        }
-      }
-    }
-  };
-
-  // 断连自愈:disconnected/failed 时重新协商、重新收集候选(可切到 TURN 中继)。
-  // 关键——单纯 restartIce() 不会自动重发 offer,必须由发起方主动重连。
-  const onStateChange = () => {
-    const st = pc.connectionState;
-    const ist = pc.iceConnectionState;
-    if (st === 'failed' || ist === 'failed') recoverPeer(peerId, 0);
-    else if (st === 'disconnected' || ist === 'disconnected') recoverPeer(peerId, 4000);
-  };
-  pc.onconnectionstatechange = onStateChange;
-  pc.oniceconnectionstatechange = onStateChange;
-
-  return pc;
+async function sfuCall(op, body) {
+  const r = await fetch('/api/sfu/' + op, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok || data.errorCode) throw new Error(data.error || data.errorDescription || data.errorCode || `SFU ${op} ${r.status}`);
+  return data;
 }
 
-// 触发重连:发起方直接重启 ICE;应答方发信令请发起方重启(避免双方同时发 offer 撞车)
-function triggerRestart(peerId) {
-  const peer = state.peers.get(peerId);
-  if (!peer?.pc) return;
-  const now = Date.now();
-  if (peer.restartCooldownUntil && now < peer.restartCooldownUntil) return; // 防重连风暴
-  peer.restartCooldownUntil = now + 6000;
-  if (peer.isOfferer) doIceRestart(peerId);
-  else sendSignal(peerId, { restart: true });
+// SFU 发来 offer(订阅新轨道等):应答并回传
+async function answerSfuOffer(conn, offer) {
+  await conn.pc.setRemoteDescription(offer);
+  await conn.pc.setLocalDescription(await conn.pc.createAnswer());
+  await conn.call('renegotiate', { sessionDescription: conn.pc.localDescription });
 }
 
-// 等 delay 毫秒后若仍未恢复,才真正重连(disconnected 常能自愈,先给它机会)
-function recoverPeer(peerId, delay) {
-  const peer = state.peers.get(peerId);
-  if (!peer?.pc) return;
-  clearTimeout(peer.recoverTimer);
-  peer.recoverTimer = setTimeout(() => {
-    const pc = peer.pc;
-    if (!pc) return;
-    const good = pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed';
-    if (!good) triggerRestart(peerId);
-  }, delay);
+function startMedia() {
+  sfu.pub = new SfuConn();
+  sfu.sub = new SfuConn(onRemoteTrack);
 }
 
-// 发起方重新协商 + 重新收集候选(iceRestart:true 会生成新 ICE 凭证,重跑连通性检查)
-async function doIceRestart(peerId) {
-  const peer = state.peers.get(peerId);
-  if (!peer?.pc) return;
+function stopMedia() {
+  sfu.pub?.close();
+  sfu.sub?.close();
+  sfu.pub = sfu.sub = null;
+  sfu.published = {};
+  sfu.subs.clear();
+  sfu.byMid.clear();
+  sfu.syncQueued = false;
+}
+
+// 媒体连接断了(网络切换等):整套重建 — 新会话、重新发布、重新订阅
+async function restartMedia() {
+  if (sfu.restarting || !state.channelId || !sfu.pub) return;
+  sfu.restarting = true;
+  $('netStatus').hidden = false;
   try {
-    const offer = await peer.pc.createOffer({ iceRestart: true });
-    await peer.pc.setLocalDescription(offer);
-    sendSignal(peerId, { sdp: peer.pc.localDescription });
-  } catch {}
+    for (const p of state.peers.values()) detachAll(p);
+    stopMedia();
+    await new Promise((r) => setTimeout(r, 1000));
+    if (!state.channelId) return;
+    startMedia();
+    await publishCurrent();
+    syncSubscriptions();
+    $('netStatus').hidden = true;
+  } finally {
+    sfu.restarting = false;
+  }
 }
 
-// 按服务器的中继模式生成 PeerConnection 配置:
-//   force → 只用 relay 候选(确实拿到 TURN 凭证时;没有 TURN 退回 all,否则谁都连不上)
-//   off   → 去掉 TURN 服务器,只留 STUN,只走 P2P 直连
-//   auto  → STUN + TURN,直连失败自动回落中继
+// 把当前本地的麦克风 / 屏幕 / 摄像头全部发布出去(进频道、媒体重建时)
+async function publishCurrent() {
+  const entries = [];
+  if (state.micTrack) entries.push(...micEntries());
+  if (state.screenStream) entries.push(...screenEntries());
+  if (state.camStream) entries.push(...camEntries());
+  if (entries.length) {
+    try {
+      await publishTracks(entries);
+    } catch (e) {
+      console.warn('SFU 发布失败', e);
+      alert('连接媒体服务器失败:' + e.message);
+    }
+  }
+  if (state.screenStream) applyScreenParams();
+  sendPublish();
+}
+
+function nextTrackName(kind) {
+  return `${kind}-${++sfu.seq}`;
+}
+function micEntries() {
+  return [{ kind: 'mic', track: state.micTrack, init: {} }];
+}
+function screenEntries() {
+  const vt = state.screenStream.getVideoTracks()[0];
+  const at = state.screenStream.getAudioTracks()[0];
+  const out = [
+    {
+      kind: 'screen',
+      track: vt,
+      init: { sendEncodings: SCREEN_LAYERS.map((rid, i) => ({ rid, scaleResolutionDownBy: 2 ** i })) },
+    },
+  ];
+  if (at) out.push({ kind: 'screenAudio', track: at, init: {} });
+  return out;
+}
+function camEntries() {
+  return [{ kind: 'cam', track: state.camStream.getVideoTracks()[0], init: { sendEncodings: [{ maxBitrate: CAM_MAX_BITRATE }] } }];
+}
+
+// 发布:加 transceiver → 本地 offer → tracks/new → 应用 SFU 的 answer
+function publishTracks(entries) {
+  const conn = sfu.pub;
+  return conn.run(async () => {
+    await conn.ensureSession();
+    const added = entries.map((e) => ({ ...e, trackName: nextTrackName(e.kind), transceiver: conn.pc.addTransceiver(e.track, { direction: 'sendonly', ...e.init }) }));
+    await conn.pc.setLocalDescription(await conn.pc.createOffer());
+    const res = await conn.call('tracks', {
+      sessionDescription: conn.pc.localDescription,
+      tracks: added.map((a) => ({ location: 'local', mid: a.transceiver.mid, trackName: a.trackName })),
+    });
+    await conn.pc.setRemoteDescription(res.sessionDescription);
+    const failed = (res.tracks || []).filter((t) => t.errorCode);
+    for (const a of added) {
+      if (failed.some((t) => t.trackName === a.trackName)) continue;
+      sfu.published[a.kind] = { trackName: a.trackName, transceiver: a.transceiver };
+    }
+    if (failed.length) throw new Error(failed[0].errorDescription || failed[0].errorCode);
+  });
+}
+
+// 取消发布:停掉 transceiver → 本地 offer → tracks/close(带 SDP 协商关闭)→ 应用 answer
+function unpublish(kinds) {
+  const conn = sfu.pub;
+  const items = kinds.map((k) => sfu.published[k]).filter(Boolean);
+  kinds.forEach((k) => delete sfu.published[k]);
+  if (!conn || !items.length) return Promise.resolve();
+  return conn
+    .run(async () => {
+      const mids = items.map((i) => i.transceiver.mid).filter(Boolean);
+      items.forEach((i) => i.transceiver.stop());
+      await conn.pc.setLocalDescription(await conn.pc.createOffer());
+      try {
+        const res = await conn.call('close', { mids, sessionDescription: conn.pc.localDescription });
+        if (res.sessionDescription) await conn.pc.setRemoteDescription(res.sessionDescription);
+      } catch (e) {
+        // 协商关闭失败:回滚本地 offer,改用强制关闭,保证 SFU 不再转发
+        await conn.pc.setLocalDescription({ type: 'rollback' }).catch(() => {});
+        await conn.call('close', { mids }).catch(() => {});
+        throw e;
+      }
+    })
+    .catch((e) => console.warn('SFU 取消发布失败', e));
+}
+
+// 向房间公布我发布了哪些轨道(其他人据此订阅)
+function sendPublish() {
+  const tracks = {};
+  for (const [kind, p] of Object.entries(sfu.published)) tracks[kind] = p.trackName;
+  const pub = sfu.pub?.session ? { sessionId: sfu.pub.session.sessionId, tracks } : null;
+  if (state.ws?.readyState === WebSocket.OPEN) state.ws.send(JSON.stringify({ type: 'publish', pub }));
+}
+
+// ---- 订阅 ----
+
+// 我要看谁的屏幕:主窗口看原画(游客看半分辨率层),其余只要缩略图层
+function wantRid(peerId) {
+  return state.focusedId === peerId ? (state.isGuest ? 'h' : 'f') : 'q';
+}
+function simulcastFor(peerId) {
+  // asciibetical:带宽不够时按 f→h→q 顺序自动降层,发布方没发某层时也按此顺序找替代
+  return { preferredRid: wantRid(peerId), priorityOrdering: 'asciibetical', ridNotAvailable: 'asciibetical' };
+}
+
+// 期望的订阅集合:房间里每个人公布的每条轨道
+function desiredSubs() {
+  const want = new Map();
+  for (const [peerId, p] of state.peers) {
+    if (!p.pub?.sessionId) continue;
+    for (const [kind, trackName] of Object.entries(p.pub.tracks || {})) {
+      const key = `${peerId}|${kind}|${p.pub.sessionId}|${trackName}`;
+      want.set(key, { key, peerId, kind, sessionId: p.pub.sessionId, trackName });
+    }
+  }
+  return want;
+}
+
+// 把实际订阅对齐到期望:关掉多余的、补上缺的、调整屏幕清晰度层。
+// 进串行队列,且同时只排一个(执行时读最新状态,多次触发合并成一次)。
+function syncSubscriptions() {
+  if (!sfu.sub || sfu.syncQueued) return;
+  sfu.syncQueued = true;
+  const conn = sfu.sub;
+  conn
+    .run(async () => {
+      sfu.syncQueued = false;
+      if (sfu.sub !== conn) return;
+      await reconcileSubs(conn);
+    })
+    .catch((e) => console.warn('SFU 订阅同步失败', e));
+}
+
+async function reconcileSubs(conn) {
+  const want = desiredSubs();
+
+  // 1. 关掉不再需要的(对方停止共享 / 离开 / 换了新轨道)
+  const stale = [...sfu.subs.values()].filter((s) => !want.has(s.key));
+  if (stale.length) {
+    for (const s of stale) {
+      sfu.subs.delete(s.key);
+      sfu.byMid.delete(s.mid);
+      detachSub(s);
+    }
+    await conn.call('close', { mids: stale.map((s) => s.mid) }).catch(() => {});
+  }
+
+  // 2. 订阅新的
+  const add = [...want.values()].filter((w) => !sfu.subs.has(w.key));
+  if (add.length) {
+    await conn.ensureSession();
+    const res = await conn.call('tracks', {
+      tracks: add.map((w) => ({
+        location: 'remote',
+        sessionId: w.sessionId,
+        trackName: w.trackName,
+        ...(w.kind === 'screen' ? { simulcast: simulcastFor(w.peerId) } : {}),
+      })),
+    });
+    // 先登记 mid → 订阅,再应用 offer(ontrack 在 setRemoteDescription 期间触发)
+    for (const t of res.tracks || []) {
+      if (t.errorCode || !t.mid) continue;
+      const w = add.find((a) => a.trackName === t.trackName && a.sessionId === t.sessionId);
+      if (!w) continue;
+      const s = { ...w, mid: t.mid, rid: w.kind === 'screen' ? wantRid(w.peerId) : null };
+      sfu.subs.set(s.key, s);
+      sfu.byMid.set(s.mid, s);
+    }
+    if (res.requiresImmediateRenegotiation && res.sessionDescription) await answerSfuOffer(conn, res.sessionDescription);
+  }
+
+  // 3. 屏幕清晰度层随焦点切换
+  const ups = [...sfu.subs.values()].filter((s) => s.kind === 'screen' && s.rid !== wantRid(s.peerId));
+  if (ups.length) {
+    const res = await conn.call('update', {
+      tracks: ups.map((s) => ({ location: 'remote', sessionId: s.sessionId, trackName: s.trackName, mid: s.mid, simulcast: simulcastFor(s.peerId) })),
+    });
+    ups.forEach((s) => (s.rid = wantRid(s.peerId)));
+    if (res.requiresImmediateRenegotiation && res.sessionDescription) await answerSfuOffer(conn, res.sessionDescription);
+  }
+}
+
+// 下行连接收到轨道:按 mid 找到是谁的哪一路,挂到对应的播放元素
+function onRemoteTrack(e) {
+  const s = sfu.byMid.get(e.transceiver.mid);
+  const p = s && state.peers.get(s.peerId);
+  if (!p) return;
+  const track = e.track;
+  if (s.kind === 'mic') {
+    p.audioEl = p.audioEl || new Audio();
+    p.audioEl.autoplay = true;
+    p.audioEl.srcObject = new MediaStream([track]);
+    safePlay(p.audioEl);
+    return;
+  }
+  // Safari:轨道挂载时还是 muted、之后才来数据,WebKit 不会自动开始渲染,unmute 时重挂一次
+  track.onunmute = () => {
+    const tile = s.kind === 'cam' ? p.camTile : p.tile;
+    const v = tile?.querySelector('video');
+    if (v) {
+      v.srcObject = s.kind === 'cam' ? p.camStream : p.videoStream;
+      safePlay(v);
+    }
+  };
+  if (s.kind === 'screen') {
+    // 屏幕画面 + 游戏声合成一条流保证音画同步;新共享换新流、重建瓦片
+    p.videoStream = new MediaStream(p.screenAudioTrack ? [track, p.screenAudioTrack] : [track]);
+    p.tile?.remove();
+    p.tile = null;
+  } else if (s.kind === 'screenAudio') {
+    p.screenAudioTrack = track;
+    if (p.videoStream) {
+      p.videoStream.addTrack(track);
+      const v = p.tile?.querySelector('video');
+      if (v) {
+        v.srcObject = p.videoStream;
+        safePlay(v);
+      }
+    }
+  } else if (s.kind === 'cam') {
+    p.camStream = new MediaStream([track]);
+    p.camTile?.remove();
+    p.camTile = null;
+  }
+  refreshTiles();
+}
+
+function detachSub(s) {
+  const p = state.peers.get(s.peerId);
+  if (!p) return;
+  if (s.kind === 'mic' && p.audioEl) p.audioEl.srcObject = null;
+  if (s.kind === 'screen') p.videoStream = null;
+  if (s.kind === 'screenAudio') p.screenAudioTrack = null;
+  if (s.kind === 'cam') p.camStream = null;
+  refreshTiles();
+}
+
+function detachAll(p) {
+  if (p.audioEl) p.audioEl.srcObject = null;
+  p.videoStream = p.camStream = p.screenAudioTrack = null;
+  p.tile?.remove();
+  p.camTile?.remove();
+  p.tile = p.camTile = null;
+}
+
+// 按服务器的中继模式生成 PeerConnection 配置(连 Cloudflare SFU 用):
+//   force → 只用 relay 候选(确实拿到 TURN 凭证时;没有 TURN 退回 all,否则连不上)
+//   off   → 去掉 TURN 服务器,只直连 SFU
+//   auto  → STUN + TURN,直连 SFU 失败时经 TURN 中继
 function iceConfig() {
   const isTurn = (s) => [].concat(s.urls).some((u) => /^turns?:/.test(u));
   const g = state.guild?.guild || {};
@@ -748,93 +979,6 @@ function iceConfig() {
   if (mode === 'off') return { iceServers: state.iceServers.filter((s) => !isTurn(s)) };
   const relay = mode === 'force' && state.iceServers.some(isTurn);
   return { iceServers: state.iceServers, iceTransportPolicy: relay ? 'relay' : 'all' };
-}
-
-function setupTransceivers(pc, asOfferer) {
-  if (asOfferer) {
-    // 无麦克风时用 'audio' 占位,方向仍 sendrecv:自己不发声,但能接收对方语音
-    const mic = pc.addTransceiver(state.micTrack || 'audio', { direction: 'sendrecv' });
-    const video = pc.addTransceiver('video', { direction: 'sendrecv' });
-    const audio = pc.addTransceiver('audio', { direction: 'sendrecv' });
-    const cam = pc.addTransceiver('video', { direction: 'sendrecv' });
-    preferH264(video);
-    preferH264(cam);
-    return { mic: mic.sender, video: video.sender, screenAudio: audio.sender, camera: cam.sender };
-  }
-  // answer 端:transceiver 由远端 offer 创建,按相同顺序取用(cam 兜底:对面是旧版页面时只有 3 条)
-  const [mic, video, audio, cam] = pc.getTransceivers();
-  [mic, video, audio, cam].filter(Boolean).forEach((t) => (t.direction = 'sendrecv'));
-  mic.sender.replaceTrack(state.micTrack);
-  preferH264(video);
-  if (cam) preferH264(cam);
-  return { mic: mic.sender, video: video.sender, screenAudio: audio.sender, camera: cam?.sender };
-}
-
-function preferH264(transceiver) {
-  try {
-    const codecs = RTCRtpReceiver.getCapabilities('video').codecs;
-    const h264 = codecs.filter((c) => /h264/i.test(c.mimeType));
-    if (h264.length) {
-      transceiver.setCodecPreferences([
-        ...h264,
-        ...codecs.filter((c) => !/h264/i.test(c.mimeType)),
-      ]);
-    }
-  } catch {}
-}
-
-async function makeOffer(peerId) {
-  const peer = state.peers.get(peerId);
-  peer.isOfferer = true; // 我发起,断连时由我负责重启 ICE
-  const pc = createPeerConnection(peerId);
-  peer.senders = setupTransceivers(pc, true);
-  await attachScreenTo(peer); // 若自己已在共享,直接带上
-  await attachCameraTo(peer);
-  const offer = await pc.createOffer();
-  await pc.setLocalDescription(offer);
-  sendSignal(peerId, { sdp: pc.localDescription });
-}
-
-async function handleSignal(from, data) {
-  let peer = state.peers.get(from);
-  if (!peer) return;
-
-  // 对方告诉我:把发给他的这一路调成高清(主窗口)/ 游客档 / 缩略图
-  if (data.want) {
-    peer.sendQuality = data.want === 'high' ? 'high' : data.want === 'mid' ? 'mid' : 'low';
-    applySendQuality(peer);
-    return;
-  }
-
-  // 应答方检测到断连,请我(发起方)重启 ICE
-  if (data.restart) {
-    if (peer.isOfferer) triggerRestart(from);
-    return;
-  }
-
-  if (data.sdp) {
-    if (data.sdp.type === 'offer') {
-      const isNew = !peer.pc;
-      const pc = peer.pc || createPeerConnection(from);
-      if (isNew) peer.isOfferer = false; // 我应答,断连时请对方重启
-      await pc.setRemoteDescription(data.sdp);
-      if (isNew) {
-        // 仅首次建连时建立 transceiver / 附加屏幕;ICE 重启的 offer 只需重新应答
-        peer.senders = setupTransceivers(pc, false);
-        await attachScreenTo(peer);
-        await attachCameraTo(peer);
-      }
-      const answer = await pc.createAnswer();
-      await pc.setLocalDescription(answer);
-      sendSignal(from, { sdp: pc.localDescription });
-    } else {
-      await peer.pc.setRemoteDescription(data.sdp);
-    }
-  } else if (data.ice) {
-    try {
-      await peer.pc.addIceCandidate(data.ice);
-    } catch {}
-  }
 }
 
 // ---------- 屏幕共享 ----------
@@ -859,34 +1003,22 @@ async function startShare() {
   vt.contentHint = 'motion'; // 游戏画面:告知编码器按运动内容优化,保帧率
   vt.onended = stopShare; // 用户从浏览器悬浮条点了"停止共享"
 
-  for (const peer of state.peers.values()) await attachScreenTo(peer);
-
-  sendState();
   $('shareBtn').setAttribute('aria-pressed', 'true');
   $('shareBtn').querySelector('span').textContent = '停止共享';
   refreshTiles();
-}
 
-// 共享屏幕/摄像头状态上报(服务端会对无权限账号强制压成 false)
-function sendState() {
-  state.ws?.send(JSON.stringify({ type: 'state', sharing: !!state.screenStream, camera: !!state.camStream }));
-}
-
-async function attachScreenTo(peer) {
-  if (!peer.senders || !state.screenStream) return;
-  const vt = state.screenStream.getVideoTracks()[0];
-  const at = state.screenStream.getAudioTracks()[0];
-  if (vt) {
-    await peer.senders.video.replaceTrack(vt);
-    applySendQuality(peer);
+  if (!sfu.pub) return; // 还没连上 SFU:连上后 publishCurrent 会带上
+  try {
+    await publishTracks(screenEntries());
+    applyScreenParams();
+  } catch (e) {
+    alert('共享失败:' + e.message);
+    return stopShare();
   }
-  if (at) await peer.senders.screenAudio.replaceTrack(at);
+  sendPublish();
 }
 
-// 按对方请求的清晰度设置发给他的这一路:主窗口=全码率全分辨率,缩略图=低码率+降分辨率。
-// mesh 里每对成员是独立 PeerConnection、独立编码器,所以能对不同人发不同码率。
-// 档位只定「码率上限」,分辨率交给编码器自适应(码率不够时按 maintain-framerate 自动降清晰度)。
-// 我作为共享者、发给「主窗口观看者」时用的码率上限(kbps):
+// 共享者的码率上限(kbps):主窗口观看者收到的 f 层
 function myShareKbps() {
   if (state.isGuest) return state.quality.guest;   // 游客共享:锁在游客档
   if (state.shareTier === 'hd') return SCREEN_MAX_BITRATE / 1000; // 高清 3.5M
@@ -894,58 +1026,58 @@ function myShareKbps() {
   return state.quality.smooth;                                    // 流畅(默认,管理员可配)
 }
 
-// 针对某个观看者算出码率上限(kbps):low=缩略图 / mid=游客观看 / high=主窗口
-function peerSendKbps(peer) {
-  const q = peer.sendQuality;
-  if (q === 'low') return THUMB_MAX_BITRATE / 1000; // 缩略图:极低码率,编码器自动降到很小的分辨率
-  if (q === 'mid') return state.quality.guest;      // 观看者是游客:锁游客档
-  return myShareKbps();                             // 主窗口:按我的共享档(游客则锁游客档)
-}
-
-// 缩略图 / 游客观看这类低码率路:直接按目标高度缩放,不靠编码器自适应慢慢往下掉
+// 缩略图层 / 游客观看层的目标高度
 const THUMB_HEIGHT = 360;
 const GUEST_VIEW_HEIGHT = 720;
 
-
-function applySendQuality(peer) {
-  if (!peer.senders?.video || !state.screenStream) return;
-  const srcH = state.screenStream.getVideoTracks()[0]?.getSettings().height || 1080;
-  const q = peer.sendQuality;
-  const lowPath = q === 'low' || q === 'mid' || state.isGuest; // 缩略图 / 游客:固定缩放 + 保帧率,不受滑杆影响
-  const t = TRADEOFFS[state.tradeoff] || TRADEOFFS[1];
-  const p = peer.senders.video.getParameters();
-  if (!p.encodings?.length) p.encodings = [{}];
-  p.encodings[0].maxBitrate = Math.round(peerSendKbps(peer) * 1000);
-  const targetH = q === 'low' ? THUMB_HEIGHT : lowPath ? GUEST_VIEW_HEIGHT : t.maxH || srcH;
-  p.encodings[0].scaleResolutionDownBy = Math.max(1, srcH / targetH);
-  p.encodings[0].maxFramerate = lowPath ? 30 : t.fps;
-  p.degradationPreference = lowPath ? 'maintain-framerate' : t.pref;
-  peer.senders.video.setParameters(p).catch(() => {});
+// 设置屏幕三层编码参数(共享开始、切清晰度档、拖滑杆时调用):
+//   f 主窗口:档位码率,分辨率按滑杆(极致流畅压到 720p),帧率/退让策略按滑杆
+//   h 游客观看:f 的一半分辨率,码率不超过游客档
+//   q 缩略图:约 360p、300kbps
+// setParameters 必须串行:上一次还没完成时再调,浏览器会因参数过期拒绝后一次(切档后立刻拖滑杆就会丢设置)
+let paramsChain = Promise.resolve();
+function applyScreenParams() {
+  paramsChain = paramsChain.then(setScreenParams).catch((e) => console.warn('设置编码参数失败', e));
 }
 
-// 拖动质量-速度滑杆(共享中则立即对所有观看者重设)
+async function setScreenParams() {
+  const sender = sfu.published.screen?.transceiver.sender;
+  if (!sender || !state.screenStream) return;
+  const srcH = state.screenStream.getVideoTracks()[0]?.getSettings().height || 1080;
+  const t = TRADEOFFS[state.tradeoff] || TRADEOFFS[1];
+  const fKbps = myShareKbps();
+  const fScale = Math.max(1, srcH / (state.isGuest ? GUEST_VIEW_HEIGHT : t.maxH || srcH));
+  const layer = {
+    f: { scaleResolutionDownBy: fScale, maxBitrate: fKbps * 1000, maxFramerate: state.isGuest ? 30 : t.fps },
+    h: { scaleResolutionDownBy: fScale * 2, maxBitrate: Math.min(state.quality.guest, fKbps) * 1000, maxFramerate: 30 },
+    q: { scaleResolutionDownBy: Math.max(fScale * 2, srcH / THUMB_HEIGHT), maxBitrate: THUMB_MAX_BITRATE, maxFramerate: 30 },
+  };
+  const p = sender.getParameters();
+  if (!p.encodings?.length) return;
+  for (const enc of p.encodings) Object.assign(enc, layer[enc.rid] || layer.f);
+  p.degradationPreference = state.isGuest ? 'maintain-framerate' : t.pref;
+  await sender.setParameters(p);
+}
+
+// 拖动质量-速度滑杆(共享中立即生效)
 function setTradeoff(v) {
   state.tradeoff = v;
   try { localStorage.setItem('sp-tradeoff', String(v)); } catch {}
   $('tradeoffBox').title = `带宽/性能不够时的取舍:${TRADEOFFS[v].label}`;
-  if (state.screenStream) for (const p of state.peers.values()) applySendQuality(p);
+  applyScreenParams();
 }
 
-// 切换共享清晰度档(共享中则立即对所有观看者重设)
+// 切换共享清晰度档(共享中立即生效)
 function setShareTier(tier) {
   state.shareTier = tier;
   try { localStorage.setItem('sp-tier', tier); } catch {}
-  if (state.screenStream) for (const p of state.peers.values()) applySendQuality(p);
+  applyScreenParams();
 }
 
 function stopShare() {
   state.screenStream?.getTracks().forEach((t) => t.stop());
   state.screenStream = null;
-  for (const peer of state.peers.values()) {
-    peer.senders?.video.replaceTrack(null);
-    peer.senders?.screenAudio.replaceTrack(null);
-  }
-  sendState();
+  unpublish(['screen', 'screenAudio']).then(sendPublish);
   $('shareBtn').setAttribute('aria-pressed', 'false');
   $('shareBtn').querySelector('span').textContent = '共享屏幕';
   refreshTiles();
@@ -969,17 +1101,22 @@ async function startCamera() {
   }
   state.camStream = stream;
   stream.getVideoTracks()[0].onended = stopCamera;
-  for (const peer of state.peers.values()) await attachCameraTo(peer);
-  sendState();
   camUi(true);
   refreshTiles();
+  if (!sfu.pub) return;
+  try {
+    await publishTracks(camEntries());
+  } catch (e) {
+    alert('开启摄像头失败:' + e.message);
+    return stopCamera();
+  }
+  sendPublish();
 }
 
 function stopCamera() {
   state.camStream?.getTracks().forEach((t) => t.stop());
   state.camStream = null;
-  for (const peer of state.peers.values()) peer.senders?.camera?.replaceTrack(null);
-  sendState();
+  unpublish(['cam']).then(sendPublish);
   camUi(false);
   refreshTiles();
 }
@@ -989,17 +1126,6 @@ function camUi(on) {
   b.setAttribute('aria-pressed', String(on));
   b.classList.toggle('is-on', on);
   applyShareUi();
-}
-
-async function attachCameraTo(peer) {
-  if (!peer.senders?.camera || !state.camStream) return;
-  const vt = state.camStream.getVideoTracks()[0];
-  if (!vt) return;
-  await peer.senders.camera.replaceTrack(vt);
-  const p = peer.senders.camera.getParameters();
-  if (!p.encodings?.length) p.encodings = [{}];
-  p.encodings[0].maxBitrate = CAM_MAX_BITRATE;
-  peer.senders.camera.setParameters(p).catch(() => {});
 }
 
 // ---------- 麦克风 / 离开 ----------
@@ -1023,7 +1149,7 @@ $('inviteBtn').addEventListener('click', async () => {
 // ---------- 成员与画面渲染 ----------
 
 function addPeer(p) {
-  state.peers.set(p.id, { name: p.name, sharing: !!p.sharing, camera: !!p.camera, videoStream: null, camStream: null });
+  state.peers.set(p.id, { name: p.name, sharing: !!p.sharing, camera: !!p.camera, pub: p.pub || null, videoStream: null, camStream: null });
   renderMembers();
   refreshTiles();
 }
@@ -1031,11 +1157,8 @@ function addPeer(p) {
 function removePeer(id) {
   const peer = state.peers.get(id);
   if (!peer) return;
-  peer.pc?.close();
-  peer.audioEl && (peer.audioEl.srcObject = null);
-  peer.tile?.remove();
-  peer.camTile?.remove();
-  state.peers.delete(id);
+  detachAll(peer);
+  state.peers.delete(id); // 其订阅在下次 syncSubscriptions 时关闭
   renderMembers();
   refreshTiles();
 }
@@ -1169,18 +1292,10 @@ function setFocus(key) {
   refreshTiles();
 }
 
-// 我在看谁 → 告诉每个正在共享的人:把我当主窗口的发高清,其余发缩略图(省上行/下行带宽)
+// 我在看谁 → 主窗口那路切到原画层,其余切到缩略图层(省下行带宽);实际切换在订阅同步里做
 function updateViewQuality() {
-  for (const [id, p] of state.peers) {
-    if (!p.sharing) {
-      p.viewReq = null;
-      continue;
-    }
-    const want = state.focusedId === id ? (state.isGuest ? 'mid' : 'high') : 'low';
-    if (p.viewReq !== want) {
-      p.viewReq = want;
-      sendSignal(id, { want });
-    }
+  for (const s of sfu.subs.values()) {
+    if (s.kind === 'screen' && s.rid !== wantRid(s.peerId)) return syncSubscriptions();
   }
 }
 
@@ -1236,119 +1351,116 @@ function videoDebug(v, s) {
 }
 
 function startStatsLoop() {
-  const last = new Map(); // peerId+mid / 'local' -> bytes
+  const last = new Map(); // mid / 'local:*' -> 上一轮的字节数 / 解码帧数
+  const kbpsOf = (key, bytes) => {
+    const kbps = Math.round(((bytes - (last.get(key) || 0)) * 8) / 2000);
+    last.set(key, bytes);
+    return Math.max(0, kbps);
+  };
   setInterval(async () => {
-    for (const [id, p] of state.peers) {
-      if (!p.pc || (!p.tile && !p.camTile)) continue;
+    // ---- 下行:每路订阅的分辨率 / 帧率 / 码率 + 渲染自愈 ----
+    if (sfu.sub && state.peers.size) {
       try {
-        const stats = await p.pc.getStats();
+        const stats = await sfu.sub.pc.getStats();
         stats.forEach((s) => {
-          if (s.type === 'inbound-rtp' && s.kind === 'video') {
-            // 一条连接里有两路视频:按 m-line 序号区分(1=屏幕,3=摄像头;旧端无 mid 按屏幕算)
-            const isCam = s.mid === '3';
-            const tile = isCam ? p.camTile : p.tile;
-            const key = id + ':' + (s.mid ?? 'v');
-            const prev = last.get(key) || 0;
-            const delta = s.bytesReceived - prev;
-            const kbps = Math.round((delta * 8) / 2000);
-            last.set(key, s.bytesReceived);
-            const decKey = key + ':dec';
-            const decoding = (s.framesDecoded || 0) > (last.get(decKey) || 0);
-            last.set(decKey, s.framesDecoded || 0);
-            const v = tile?.querySelector('video');
-            // 画面状态诊断:在解码却没画面 = 渲染侧问题(iOS 常见:播放被暂停 / 流没刷新到 <video>)
-            const paused = !!v && v.paused;
-            const blank = !!v && !v.videoWidth;
-            const statsEl = tile?.querySelector('.tile-stats');
-            if (statsEl)
-              statsEl.textContent =
-                `${s.frameWidth || '?'}×${s.frameHeight || '?'} ` +
-                `${s.framesPerSecond || 0}fps ${kbps}kbps` +
-                (paused ? ' ⏸点画面播放' : blank ? ' ·未渲染' : '') +
-                (DEBUG && v ? '\n' + videoDebug(v, s) : '');
-            // 渲染自愈:连续 2 轮(~4s)在解码但 <video> 暂停或没画面 → 重挂流并重新播放
-            if (v && decoding && (paused || blank || v.readyState < 2)) {
-              const n = (p.renderTicks?.[decKey] || 0) + 1;
-              p.renderTicks = { ...p.renderTicks, [decKey]: n };
-              if (n >= 2) {
-                p.renderTicks[decKey] = 0;
-                v.srcObject = null;
-                v.srcObject = isCam ? p.camStream : p.videoStream;
-                safePlay(v);
-              }
-            } else if (p.renderTicks?.[decKey]) {
+          if (s.type !== 'inbound-rtp' || s.kind !== 'video') return;
+          const sub = sfu.byMid.get(s.mid);
+          const p = sub && state.peers.get(sub.peerId);
+          if (!p) return;
+          const isCam = sub.kind === 'cam';
+          const tile = isCam ? p.camTile : p.tile;
+          const kbps = kbpsOf(s.mid, s.bytesReceived);
+          const decKey = s.mid + ':dec';
+          const decoding = (s.framesDecoded || 0) > (last.get(decKey) || 0);
+          last.set(decKey, s.framesDecoded || 0);
+          const v = tile?.querySelector('video');
+          // 画面状态诊断:在解码却没画面 = 渲染侧问题(iOS 常见:播放被暂停 / 流没刷新到 <video>)
+          const paused = !!v && v.paused;
+          const blank = !!v && !v.videoWidth;
+          const layer = !isCam && sub.rid ? ` [${{ f: '原画', h: '中', q: '缩略' }[sub.rid]}]` : '';
+          const statsEl = tile?.querySelector('.tile-stats');
+          if (statsEl)
+            statsEl.textContent =
+              `${s.frameWidth || '?'}×${s.frameHeight || '?'} ` +
+              `${s.framesPerSecond || 0}fps ${kbps}kbps${layer}` +
+              (paused ? ' ⏸点画面播放' : blank ? ' ·未渲染' : '') +
+              (DEBUG && v ? '\n' + videoDebug(v, s) : '');
+          // 渲染自愈:连续 2 轮(~4s)在解码但 <video> 暂停或没画面 → 重挂流并重新播放
+          if (v && decoding && (paused || blank || v.readyState < 2)) {
+            const n = (p.renderTicks?.[decKey] || 0) + 1;
+            p.renderTicks = { ...p.renderTicks, [decKey]: n };
+            if (n >= 2) {
               p.renderTicks[decKey] = 0;
+              v.srcObject = null;
+              v.srcObject = isCam ? p.camStream : p.videoStream;
+              safePlay(v);
             }
-            // 卡死自愈兜底:对方在共享屏幕却连续多轮零字节(ICE 仍显示 connected 的僵死),强制重连
-            if (!isCam && p.sharing) {
-              if (delta <= 0) {
-                p.stallTicks = (p.stallTicks || 0) + 1;
-                if (p.stallTicks >= 8) { p.stallTicks = 0; triggerRestart(id); } // ~16s 无数据
-              } else {
-                p.stallTicks = 0;
-              }
-            }
+          } else if (p.renderTicks?.[decKey]) {
+            p.renderTicks[decKey] = 0;
           }
         });
 
-        // 线路指示:当前选中的候选对里任一端是 relay = 走 TURN 中继,否则 P2P 直连
-        let route = '';
-        let isRelay = false;
-        let pair = null;
-        stats.forEach((s) => {
-          if (s.type === 'transport' && s.selectedCandidatePairId) pair = stats.get(s.selectedCandidatePairId);
-        });
-        if (!pair)
-          stats.forEach((s) => {
-            if (s.type === 'candidate-pair' && s.nominated && s.state === 'succeeded') pair = s;
-          });
-        if (pair) {
-          const lc = stats.get(pair.localCandidateId) || {};
-          const rc = stats.get(pair.remoteCandidateId) || {};
-          isRelay = lc.candidateType === 'relay' || rc.candidateType === 'relay';
-          // 直连时标出 IPv4 / IPv6(按选中候选对的实际地址;mDNS 匿名名或拿不到地址时不标)
-          const ipv = (c) => {
-            const a = c.address || c.ip || '';
-            return a.endsWith('.local') ? '' : a.includes(':') ? 'IPv6' : /^\d+\.\d+\.\d+\.\d+$/.test(a) ? 'IPv4' : '';
-          };
-          const ver = ipv(lc) || ipv(rc);
-          route = isRelay ? 'TURN中继' : ver ? `P2P直连·${ver}` : 'P2P直连';
-        }
-        for (const t of [p.tile, p.camTile]) {
-          const el = t?.querySelector('.tile-route');
-          if (el) {
-            el.textContent = route;
-            el.classList.toggle('is-relay', isRelay);
+        // 线路指示:我到 Cloudflare SFU 这条连接走的是直连还是 TURN 中继、IPv4 还是 IPv6
+        const route = routeLabel(stats);
+        for (const p of state.peers.values()) {
+          for (const t of [p.tile, p.camTile]) {
+            const el = t?.querySelector('.tile-route');
+            if (el) {
+              el.textContent = route.text;
+              el.classList.toggle('is-relay', route.relay);
+            }
           }
         }
       } catch {}
     }
-    // 本地上行码率:优先看发给主窗口观看者的那一路(缩略图路本来就是低分辨率,看它没意义)
-    if (localTile && state.peers.size) {
-      const withVideo = [...state.peers.values()].filter((p) => p.senders?.video?.track);
-      const first = withVideo.find((p) => p.sendQuality !== 'low') || withVideo[0];
-      if (first) {
-        try {
-          const stats = await first.pc.getStats(first.senders.video.track);
-          stats.forEach((s) => {
-            if (s.type === 'outbound-rtp' && s.kind === 'video') {
-              const prev = last.get('local') || 0;
-              const kbps = Math.round(((s.bytesSent - prev) * 8) / 2000);
-              last.set('local', s.bytesSent);
-              // 编码受限原因 + 编码器实现:排查"为什么自动降分辨率/画面糊"
-              const limit = { bandwidth: ' ·带宽受限', cpu: ' ·CPU受限', other: ' ·受限' }[s.qualityLimitationReason] || '';
-              // 只取括号里的具体实现名(如 "ExternalEncoder (MediaFoundation...)" → MediaFoundation...),避免挤爆角标
-              const encName = (s.encoderImplementation || '').replace(/^[^(]*\(|\)[^)]*$/g, '').slice(0, 24);
-              const enc = encName ? ` ${encName}` : '';
-              localTile.querySelector('.tile-stats').textContent =
-                `↑ ${s.frameWidth || '?'}×${s.frameHeight || '?'} ` +
-                `${s.framesPerSecond || 0}fps ${kbps}kbps ×${state.peers.size}路${limit}${enc}`;
-            }
-          });
-        } catch {}
-      }
+
+    // ---- 上行:屏幕三层合计码率;分辨率/帧率/受限原因看原画层 f ----
+    const screenSender = sfu.published.screen?.transceiver.sender;
+    if (localTile && screenSender) {
+      try {
+        const stats = await screenSender.getStats();
+        let total = 0;
+        let f = null;
+        stats.forEach((s) => {
+          if (s.type !== 'outbound-rtp' || s.kind !== 'video') return;
+          total += kbpsOf('local:' + (s.rid || 'f'), s.bytesSent);
+          if (!f || s.rid === 'f') f = s;
+        });
+        if (f) {
+          // 编码受限原因 + 编码器实现:排查"为什么自动降分辨率/画面糊"
+          const limit = { bandwidth: ' ·带宽受限', cpu: ' ·CPU受限', other: ' ·受限' }[f.qualityLimitationReason] || '';
+          // 只取括号里的具体实现名(如 "SimulcastEncoderAdapter (libvpx, libvpx)" → libvpx, libvpx),避免挤爆角标
+          const encName = (f.encoderImplementation || '').replace(/^[^(]*\(|\)[^)]*$/g, '').slice(0, 24);
+          localTile.querySelector('.tile-stats').textContent =
+            `↑ ${f.frameWidth || '?'}×${f.frameHeight || '?'} ` +
+            `${f.framesPerSecond || 0}fps ${total}kbps →SFU${limit}${encName ? ' ' + encName : ''}`;
+        }
+      } catch {}
     }
   }, 2000);
+}
+
+// 选中候选对 → 线路标识。对端是 Cloudflare 边缘,不再是别的成员
+function routeLabel(stats) {
+  let pair = null;
+  stats.forEach((s) => {
+    if (s.type === 'transport' && s.selectedCandidatePairId) pair = stats.get(s.selectedCandidatePairId);
+  });
+  if (!pair)
+    stats.forEach((s) => {
+      if (s.type === 'candidate-pair' && s.nominated && s.state === 'succeeded') pair = s;
+    });
+  if (!pair) return { text: '', relay: false };
+  const lc = stats.get(pair.localCandidateId) || {};
+  const rc = stats.get(pair.remoteCandidateId) || {};
+  const relay = lc.candidateType === 'relay' || rc.candidateType === 'relay';
+  // 标出 IPv4 / IPv6(按选中候选对的实际地址;mDNS 匿名名或拿不到地址时不标)
+  const ipv = (c) => {
+    const a = c.address || c.ip || '';
+    return a.endsWith('.local') ? '' : a.includes(':') ? 'IPv6' : /^\d+\.\d+\.\d+\.\d+$/.test(a) ? 'IPv4' : '';
+  };
+  const ver = ipv(rc) || ipv(lc);
+  return { text: relay ? 'SFU·TURN中继' : ver ? `SFU·${ver}` : 'SFU', relay };
 }
 
 // ---------- 管理:弹窗 / 菜单 / 增删改(阶段 3) ----------
@@ -1528,12 +1640,13 @@ function openServerSettings() {
   // TURN 中继模式:自动 / 强制 / 关闭。没配置 TURN 时「强制」不可选
   const relay = document.createElement('select');
   relay.className = 'field-input';
+  // 音视频都经 Cloudflare SFU 转发;这里只决定「连到 SFU」这一段要不要经 TURN
   const RELAY_NOTES = {
-    auto: '优先 P2P 直连,直连失败的成员之间自动改走 TURN 中继。',
-    force: '画面和语音全部经 TURN 服务器转发:占用服务器带宽/流量,延迟略增,适合 P2P 线路差的情况。',
-    off: '只走 P2P 直连,完全不用 TURN 服务器;打洞失败的成员之间会连不上。',
+    auto: '直连 Cloudflare SFU;所在网络屏蔽 UDP 等直连不上时,自动经 TURN 中继转一道。',
+    force: '所有人都先经 TURN 服务器再到 SFU:多一跳、占 TURN 流量,只在直连 SFU 线路差时使用。',
+    off: '不用 TURN,只直连 SFU;网络严格(屏蔽 UDP)的成员可能连不上。',
   };
-  for (const [val, label] of [['auto', '自动(推荐)'], ['force', '强制走中继'], ['off', '关闭中继(仅 P2P 直连)']]) {
+  for (const [val, label] of [['auto', '自动(推荐)'], ['force', '强制经 TURN 中继'], ['off', '不用 TURN']]) {
     const o = document.createElement('option');
     o.value = val;
     o.textContent = label;
@@ -1580,7 +1693,7 @@ function openServerSettings() {
     });
     if (!r.ok) return (alert(r.error || '保存失败'), false);
     await loadGuild();
-    if (state.screenStream) for (const p of state.peers.values()) applySendQuality(p); // 新码率立即生效
+    applyScreenParams(); // 新码率立即生效
   }, '保存');
 }
 
@@ -1782,7 +1895,7 @@ async function switchMic() {
   fresh.enabled = !wasMuted;
   state.micTrack = fresh;
   old?.stop();
-  for (const p of state.peers.values()) p.senders?.mic?.replaceTrack(fresh);
+  sfu.published.mic?.transceiver.sender.replaceTrack(fresh); // 同一条已发布轨道换源,不用重新发布
   applyMicUi();
   if (state.channelId) startMeter();
 }
@@ -1800,7 +1913,7 @@ async function switchCamera() {
   const old = state.camStream;
   state.camStream = stream;
   stream.getVideoTracks()[0].onended = stopCamera;
-  for (const p of state.peers.values()) await attachCameraTo(p);
+  await sfu.published.cam?.transceiver.sender.replaceTrack(stream.getVideoTracks()[0]);
   old?.getTracks().forEach((t) => t.stop());
   if (localCamTile) {
     const v = localCamTile.querySelector('video');

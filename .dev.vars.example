@@ -6,6 +6,10 @@ ADMIN_USERNAME=admin
 ADMIN_PASSWORD=change-me-please
 ADMIN_NICKNAME=管理员
 
+# Cloudflare Realtime SFU(必填,dashboard → Realtime → SFU 创建应用获得)
+REALTIME_APP_ID=
+REALTIME_APP_SECRET=
+
 # 服务器显示名(可选,缺省 ScreenParty)
 GUILD_NAME=ScreenParty
 

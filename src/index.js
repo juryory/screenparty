@@ -1,14 +1,20 @@
 // ScreenParty — 信令服务 (Cloudflare Worker + Durable Object)
-// 媒体流走 WebRTC mesh 点对点传输,本服务只负责:
+// 媒体流走 Cloudflare Realtime SFU:每人一条上行连接发布自己的麦克风/屏幕/摄像头,
+// 一条下行连接按需订阅别人的轨道。本服务负责:
 //   1. 鉴权     账号登录 / 自助注册 / 游客会话 / 管理员用户管理
 //               (目前所有登录者含游客都能共享;游客画质由前端锁在游客档)
-//   2. /ws/:room   房间信令 (join / signal 转发 / 成员状态广播)
-//   3. /api/turn   可选:签发 TURN 临时凭证(自建 coturn / Cloudflare Realtime)
-//   4. 其余路径    静态前端 (public/)
+//   2. /ws/:room   房间信令 (成员进出 / 各人发布了哪些轨道 的广播)
+//   3. /api/sfu/*  代调 Realtime SFU API(App Secret 只在服务端,浏览器拿不到)
+//   4. /api/turn   可选:签发 TURN 临时凭证(UDP 受限网络连 SFU 时兜底)
+//   5. 其余路径    静态前端 (public/)
+// P2P mesh + 自建 coturn 的版本保留在 tencent 分支。
 
 import { DurableObject } from 'cloudflare:workers';
 
-const MAX_PEERS = 8;
+// SFU 下共享者只上传一份,不再受 mesh 上行限制;上限主要看每人下行能收几路
+const MAX_PEERS = 12;
+
+const SFU_API = 'https://rtc.live.cloudflare.com/v1/apps';
 
 const SESSION_COOKIE = 'sp_session';
 const SESSION_TTL_MS = 7 * 24 * 60 * 60 * 1000; // 7 天
@@ -127,6 +133,69 @@ function tooMany() {
   return Response.json({ error: '操作太频繁,请稍后再试' }, { status: 429 });
 }
 
+// ---------- Realtime SFU 参数校验 ----------
+
+const SFU_ID_RE = /^[\w-]{1,128}$/;
+const TRACK_NAME_RE = /^[\w.:-]{1,64}$/;
+const RIDS = ['f', 'h', 'q'];
+const SIMULCAST_POLICIES = ['none', 'asciibetical'];
+
+async function sfuToken(secret, sessionId, username) {
+  const key = await crypto.subtle.importKey('raw', new TextEncoder().encode(secret), { name: 'HMAC', hash: 'SHA-256' }, false, ['sign']);
+  const sig = await crypto.subtle.sign('HMAC', key, new TextEncoder().encode(`sfu|${sessionId}|${username}`));
+  return bytesToHex(new Uint8Array(sig));
+}
+
+function sanitizeSdp(d) {
+  if (!d || typeof d !== 'object') return null;
+  if (d.type !== 'offer' && d.type !== 'answer') return null;
+  if (typeof d.sdp !== 'string' || !d.sdp || d.sdp.length > 200_000) return null;
+  return { type: d.type, sdp: d.sdp };
+}
+
+// 只放行已知字段:本地轨道 {location,mid,trackName};远端轨道 {location,sessionId,trackName,mid?,simulcast?}
+function sanitizeTracks(list) {
+  if (!Array.isArray(list) || !list.length || list.length > 32) return null;
+  const out = [];
+  for (const t of list) {
+    if (!t || typeof t !== 'object' || !TRACK_NAME_RE.test(String(t.trackName || ''))) return null;
+    const o = { location: t.location === 'local' ? 'local' : 'remote', trackName: String(t.trackName) };
+    if (t.mid !== undefined) {
+      if (!/^[\w#-]{1,64}$/.test(String(t.mid))) return null;
+      o.mid = String(t.mid);
+    }
+    if (o.location === 'remote') {
+      if (!SFU_ID_RE.test(String(t.sessionId || ''))) return null;
+      o.sessionId = String(t.sessionId);
+      if (t.simulcast && RIDS.includes(t.simulcast.preferredRid)) {
+        o.simulcast = {
+          preferredRid: t.simulcast.preferredRid,
+          priorityOrdering: SIMULCAST_POLICIES.includes(t.simulcast.priorityOrdering) ? t.simulcast.priorityOrdering : 'none',
+          ridNotAvailable: SIMULCAST_POLICIES.includes(t.simulcast.ridNotAvailable) ? t.simulcast.ridNotAvailable : 'none',
+        };
+      }
+    } else if (!o.mid) {
+      return null;
+    }
+    out.push(o);
+  }
+  return out;
+}
+
+// 成员广播的发布信息:{ sessionId, tracks: { mic, screen, screenAudio, cam } }(值为轨道名)
+const PUB_KINDS = ['mic', 'screen', 'screenAudio', 'cam'];
+function sanitizePub(p, canShare) {
+  if (!p || typeof p !== 'object' || !SFU_ID_RE.test(String(p.sessionId || ''))) return null;
+  const tracks = {};
+  for (const k of PUB_KINDS) {
+    const name = p.tracks?.[k];
+    if (!name || !TRACK_NAME_RE.test(String(name))) continue;
+    if (k !== 'mic' && !canShare) continue; // 无共享权限:只允许发布麦克风
+    tracks[k] = String(name);
+  }
+  return { sessionId: String(p.sessionId), tracks };
+}
+
 // ---------- Worker 入口 ----------
 
 export default {
@@ -239,6 +308,13 @@ export default {
       return Response.json({ counts: await guild.presenceCounts() });
     }
 
+    // Realtime SFU 代理:浏览器经这里创建会话、发布/订阅/关闭轨道
+    if (url.pathname.startsWith('/api/sfu/') && request.method === 'POST') {
+      const user = await auth.verify(getCookie(request, SESSION_COOKIE));
+      if (!user) return Response.json({ error: 'unauthorized' }, { status: 401 });
+      return this.sfuApi(request, url, env, user);
+    }
+
     // TURN 临时凭证:同样需登录,杜绝匿名占用中继带宽
     if (url.pathname === '/api/turn') {
       const user = await auth.verify(getCookie(request, SESSION_COOKIE));
@@ -303,6 +379,7 @@ export default {
         me: { username: user.username, nickname: user.nickname, role },
         // 是否配置了 TURN:没有时"强制中继"无法生效(只剩 relay 候选会全连不上),前端据此禁用开关
         relayAvailable: !!((env.COTURN_HOST && env.COTURN_SECRET) || (env.TURN_KEY_ID && env.TURN_KEY_API_TOKEN)),
+        sfuConfigured: !!(env.REALTIME_APP_ID && env.REALTIME_APP_SECRET),
       });
     }
     if (url.pathname === '/api/guild' && method === 'PATCH') {
@@ -357,6 +434,75 @@ export default {
     }
 
     return new Response('method not allowed', { status: 405 });
+  },
+
+  // ---- Realtime SFU 代理 ----
+  // 会话归属:创建会话时签发 token = HMAC(App Secret, 会话ID|用户名),之后对该会话的
+  // 每个操作都要带上它,别人拿到会话 ID 也无法替你发布/关闭轨道。
+  // 订阅别人的轨道只需知道其会话 ID + 轨道名,这两样只在(可设密码的)频道信令里广播。
+  async sfuApi(request, url, env, user) {
+    const appId = env.REALTIME_APP_ID;
+    const secret = env.REALTIME_APP_SECRET;
+    if (!appId || !secret) {
+      return Response.json({ error: '服务器未配置 Cloudflare Realtime SFU(REALTIME_APP_ID / REALTIME_APP_SECRET)' }, { status: 503 });
+    }
+    const call = async (method, path, body) => {
+      let r;
+      try {
+        r = await fetch(`${env.SFU_API_BASE || SFU_API}/${appId}${path}`, {
+          method,
+          headers: { Authorization: `Bearer ${secret}`, 'Content-Type': 'application/json' },
+          body: body ? JSON.stringify(body) : undefined,
+        });
+      } catch {
+        return Response.json({ error: 'SFU 连接失败' }, { status: 502 });
+      }
+      const data = await r.json().catch(() => ({}));
+      return Response.json(data, { status: r.ok ? 200 : r.status });
+    };
+    const body = await request.json().catch(() => ({}));
+    const op = url.pathname.slice('/api/sfu/'.length);
+
+    if (op === 'session') {
+      const r = await fetch(`${env.SFU_API_BASE || SFU_API}/${appId}/sessions/new`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${secret}` },
+      }).catch(() => null);
+      const data = r ? await r.json().catch(() => ({})) : {};
+      if (!r?.ok || !data.sessionId) return Response.json({ error: 'SFU 会话创建失败', detail: data }, { status: 502 });
+      return Response.json({ sessionId: data.sessionId, token: await sfuToken(secret, data.sessionId, user.username) });
+    }
+
+    // 以下操作都针对调用者自己的会话
+    const sessionId = String(body.sessionId || '');
+    if (!SFU_ID_RE.test(sessionId) || String(body.token || '') !== (await sfuToken(secret, sessionId, user.username))) {
+      return Response.json({ error: 'SFU 会话无效' }, { status: 403 });
+    }
+    const sdp = sanitizeSdp(body.sessionDescription);
+    const base = `/sessions/${sessionId}`;
+
+    if (op === 'tracks') {
+      const tracks = sanitizeTracks(body.tracks);
+      if (!tracks) return Response.json({ error: '轨道参数无效' }, { status: 400 });
+      return call('POST', `${base}/tracks/new`, sdp ? { sessionDescription: sdp, tracks } : { tracks });
+    }
+    if (op === 'update') {
+      const tracks = sanitizeTracks(body.tracks);
+      if (!tracks) return Response.json({ error: '轨道参数无效' }, { status: 400 });
+      return call('PUT', `${base}/tracks/update`, { tracks });
+    }
+    if (op === 'renegotiate') {
+      if (!sdp) return Response.json({ error: '缺少 SDP' }, { status: 400 });
+      return call('PUT', `${base}/renegotiate`, { sessionDescription: sdp });
+    }
+    if (op === 'close') {
+      const mids = Array.isArray(body.mids) ? body.mids.map(String).filter((m) => /^[\w#-]{1,64}$/.test(m)).slice(0, 64) : [];
+      if (!mids.length) return Response.json({ tracks: [] });
+      const payload = { tracks: mids.map((mid) => ({ mid })), force: !sdp };
+      if (sdp) payload.sessionDescription = sdp;
+      return call('PUT', `${base}/tracks/close`, payload);
+    }
+    return Response.json({ error: 'not found' }, { status: 404 });
   },
 
   async turnCredentials(env) {
@@ -1039,43 +1185,30 @@ export class Room {
           }
         }
 
-        ws.serializeAttachment({ id, name, user: att.user, canShare: !!att.canShare, sharing: false, camera: false, joinedAt: att.joinedAt || Date.now(), lastSeen: Date.now() });
+        ws.serializeAttachment({ id, name, user: att.user, canShare: !!att.canShare, sharing: false, camera: false, pub: null, joinedAt: att.joinedAt || Date.now(), lastSeen: Date.now() });
 
         // 告知新人:自己的 id + 房间里已有哪些人(新人将向他们逐一发起连接)
         const others = this.roster().filter((p) => p.id !== id && !kicked.has(p.id));
         ws.send(JSON.stringify({ type: 'welcome', id, peers: others }));
 
-        this.broadcast({ type: 'peer-joined', peer: { id, name, sharing: false, camera: false } }, ws);
+        this.broadcast({ type: 'peer-joined', peer: { id, name, sharing: false, camera: false, pub: null } }, ws);
         await this.reportPresence(kickedWs);
         break;
       }
 
-      case 'signal': {
-        // 点对点转发 SDP / ICE candidate
+      case 'publish': {
+        // 我在 SFU 上发布了哪些轨道(会话 ID + 各轨道名),广播给全房间供订阅。
+        // 共享状态由此推出;无共享权限的账号只保留麦克风。
         const me = ws.deserializeAttachment();
         if (!me || !me.id) return;
-        const target = this.state
-          .getWebSockets()
-          .find((s) => s.deserializeAttachment()?.id === msg.to);
-        target?.send(
-          JSON.stringify({ type: 'signal', from: me.id, data: msg.data }),
-        );
+        me.pub = sanitizePub(msg.pub, me.canShare);
+        me.sharing = !!me.pub?.tracks.screen;
+        me.camera = !!me.pub?.tracks.cam;
+        ws.serializeAttachment(me);
+        this.broadcast({ type: 'peer-state', id: me.id, sharing: me.sharing, camera: me.camera, pub: me.pub }, ws);
         break;
       }
 
-      case 'state': {
-        // 共享屏幕/摄像头状态,广播给全房间;无共享权限的账号一律压成 false
-        const me = ws.deserializeAttachment();
-        if (!me || !me.id) return;
-        if ('sharing' in msg) me.sharing = !!msg.sharing && !!me.canShare;
-        if ('camera' in msg) me.camera = !!msg.camera && !!me.canShare;
-        ws.serializeAttachment(me);
-        this.broadcast(
-          { type: 'peer-state', id: me.id, sharing: me.sharing, camera: !!me.camera },
-          ws,
-        );
-        break;
-      }
     }
   }
 
@@ -1101,7 +1234,7 @@ export class Room {
       .getWebSockets()
       .map((s) => s.deserializeAttachment())
       .filter((a) => a && a.id)
-      .map((a) => ({ id: a.id, name: a.name, sharing: !!a.sharing, camera: !!a.camera }));
+      .map((a) => ({ id: a.id, name: a.name, sharing: !!a.sharing, camera: !!a.camera, pub: a.pub || null }));
   }
 
   broadcast(obj, except) {

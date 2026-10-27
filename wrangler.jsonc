@@ -39,7 +39,11 @@
   //   wrangler secret put GUILD_NAME       // 可选,服务器显示名(ADMIN_USERNAME 即所有者)
   // 本地开发把它们写进 .dev.vars(已被 .gitignore 忽略)
   //
-  // 可选:接入 Cloudflare Realtime TURN 作打洞失败兜底
+  // 必配:Cloudflare Realtime SFU(dashboard → Realtime → SFU 创建应用)
+  //   wrangler secret put REALTIME_APP_ID
+  //   wrangler secret put REALTIME_APP_SECRET
+  //
+  // 可选:接入 Cloudflare Realtime TURN,给连不上 SFU(屏蔽 UDP)的网络兜底
   // 在 dashboard 创建 TURN key 后执行:
   //   wrangler secret put TURN_KEY_ID
   //   wrangler secret put TURN_KEY_API_TOKEN

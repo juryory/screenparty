@@ -1,12 +1,13 @@
 # ScreenParty · 开黑同屏
 
-多人**同时**共享屏幕 + 语音的自托管网页工具。为国内网络环境设计:
+多人**同时**共享屏幕 + 语音的自托管网页工具,整套跑在 Cloudflare 上,无需自己的服务器:
 
-- 画面与语音在成员之间 **WebRTC P2P 直连**,不经过任何服务器,走各自家宽,同城延迟通常 5–30ms
-- Cloudflare 只承担信令(进房间时交换连接信息的几 KB 流量),全部落在免费额度内
+- 画面与语音经 **Cloudflare Realtime SFU** 转发:共享者**只上传一份**,观看人数再多也不增加上行;每个观看者按自己在看什么自动选清晰度层(主窗口原画 / 缩略图低码率)
+- 每月 1000 GB 下行免费(SFU 与 TURN 共用),小圈子开黑基本用不完;信令、账号等跑在 Workers + Durable Objects 免费额度内
+- **国内用户注意**:Cloudflare 节点在境外,延迟比同城 P2P 高(通常几十到一百多毫秒)。追求同城最低延迟可用 [`tencent` 分支](../../tree/tencent):P2P 直连 + 自建国内 coturn 兜底
 - 账号鉴权:支持**自助注册**,**所有注册用户都能共享屏幕/摄像头**;也可**游客进入**(免注册,可观看也可共享,但收/发画质都锁在游客档码率)
 - **Discord / TeamSpeak 式界面**:服务器 → 分类 → 语音频道;角色分「所有者 / 管理员 / 成员」,管理员可在网页里直接建/改/删频道、改服务器信息、管成员角色
-- **屏幕 + 摄像头**可同时共享:屏幕最高 1080p30(H.264 硬编优先、运动内容提示、保帧率降级),摄像头 720p 独立一路
+- **屏幕 + 摄像头**可同时共享:屏幕最高 1080p30,三层 simulcast(原画 / 半分辨率 / 缩略图)由 SFU 按观看者分发;摄像头 720p 独立一路
 - **共享清晰度三档**(共享者自选,默认流畅):高清 1080p/3.5M · 清晰 1080p/2.5M · 流畅 720p/1.5M;清晰/流畅/游客三档码率**管理员可在服务器设置里调**
 - 可在设置里**选择麦克风/摄像头设备**,通话中热切换;用户面板下有实时**麦克风电平表**(-24 ~ 0 dB),一眼确认有没有声
 - 每个画面角落实时显示 分辨率 / 帧率 / 码率,方便排查网络问题
@@ -20,7 +21,19 @@ cd screenparty
 wrangler deploy
 ```
 
-部署完成后输出一个 `https://screenparty.<你的子域>.workers.dev` 地址。**首次部署后还需配置管理员账号(见第二节),否则无人能登录。**
+部署完成后输出一个 `https://screenparty.<你的子域>.workers.dev` 地址。**首次部署后还需配置 Realtime SFU(下面)和管理员账号(见第二节),否则进不了频道 / 无人能登录。**
+
+**配置 Cloudflare Realtime SFU(必配)**:
+
+1. Cloudflare dashboard → **Realtime** → **SFU** → 创建应用,得到 **App ID** 和 **App Secret(API Token)**
+2. 写入 Worker 密钥并重新部署:
+   ```bash
+   wrangler secret put REALTIME_APP_ID
+   wrangler secret put REALTIME_APP_SECRET
+   wrangler deploy
+   ```
+
+App Secret 只存在 Worker 里:浏览器经 `/api/sfu/*` 由 Worker 代为调用 SFU API,每个会话绑定登录用户(HMAC 令牌),别人拿到会话 ID 也无法替你发布或关闭轨道。未配置时进频道会提示「服务器还没配置 Cloudflare Realtime SFU」。
 
 > **建议绑定自定义域名**:`*.workers.dev` 在国内偶发 DNS 污染。在 Cloudflare dashboard → Workers → screenparty → Settings → Domains & Routes 添加你自己的域名(任意已托管在 Cloudflare 的域名加个子域即可)。`wrangler.jsonc` 里的 `routes` 硬编码了一个示例域名,自部署时改成你自己的或删掉该字段。
 
@@ -54,13 +67,11 @@ git push -u origin main
 之后可在 Cloudflare dashboard → Workers → 创建应用时选择「Connect to Git」关联该仓库,
 以后每次 push 自动部署,不再需要本地 wrangler。
 
-## 四、TURN 兜底(可选,直连失败时再配)
+## 四、TURN 兜底(可选)
 
-先直接用:朋友之间同城/同运营商时 P2P 打洞成功率很高,大概率用不到 TURN。
+浏览器默认直接用 UDP 连到 Cloudflare SFU,一般不需要 TURN。只有个别成员所在网络屏蔽 UDP(部分公司 / 校园网)连不上 SFU 时,才需要 TURN 帮他「先连 TURN,再到 SFU」。按需选一种:
 
-如果某两人之间始终连不上(画面黑屏但其他人正常),按需选一种:
-
-**方案 A:Cloudflare Realtime TURN(免费 1000 GB/月,但节点在境外)**
+**方案 A:Cloudflare Realtime TURN(推荐:和 SFU 同一张网,与 SFU 共用每月 1000 GB 免费额度)**
 
 1. Cloudflare dashboard → Realtime → TURN → 创建 TURN key
 2. 配置密钥:
@@ -70,7 +81,9 @@ git push -u origin main
    ```
 3. 重新部署。前端会自动从 `/api/turn` 拿到临时凭证,无需改代码。
 
-**方案 B:自建 coturn(国内 VPS,推荐)—— Docker 一键部署**
+**方案 B:自建 coturn(国内 VPS)—— Docker 一键部署**
+
+> SFU 模式下 coturn 只负责把连不上 SFU 的成员先接进来,对多数人用不到。它主要服务于 [`tencent` 分支](../../tree/tencent) 的 P2P 模式,这里也能用。
 
 > 适用:一台国内云服务器(腾讯云等,Ubuntu/Debian),已装 Docker(宝塔 → Docker 一键装,或 `curl -fsSL https://get.docker.com | sh -s -- --mirror Aliyun`)。宝塔可选(看负载、放行端口、申请 TLS 证书)。前端会自动从 `/api/turn` 拿到**临时凭证**(`use-auth-secret` 的 HMAC 签名,会过期,抓包也无法长期盗用你的中继带宽)。全程约 5 分钟。
 >
@@ -133,71 +146,50 @@ wrangler deploy                        # 重新部署使其生效
 3. `sudo party restart`,日志里会出现「TLS 已启用」;然后在本地仓库目录执行 `wrangler secret put COTURN_TLS_HOST`(填 `turn.你的域名`),再 `wrangler deploy`
 4. 证书续签后执行一次 `sudo party restart` 才会加载新证书(可在宝塔计划任务里每月跑一次)
 
-> **带宽**:每路屏幕 ~3.5 Mbps,一对中转连接在服务器上约占 **3.5 Mbps 入 + 3.5 Mbps 出**。
-> 200M 峰值带宽可轻松扛住十几路中转;而且 TURN 只对**少数打洞失败的成员对**生效,绝大多数人仍是 P2P 直连,不经过这台机器。
-
 **(可选)中继模式**:服务器 ⌄ 菜单 →「服务器设置」→「TURN 中继」三选一,每个人下次进频道时生效:
-- **自动**(默认):优先 P2P 直连,直连失败的成员之间自动走中继
-- **强制走中继**:所有连接都经服务器,画面角标显示「TURN中继」。适合个别成员之间 P2P 线路差(跨运营商丢包等)
-- **关闭中继**:只走 P2P 直连,完全不用 TURN 服务器(省服务器流量;打洞失败的成员之间会连不上)
+- **自动**(默认):直连 SFU,直连不上时自动经 TURN
+- **强制经 TURN 中继**:所有人先经 TURN 再到 SFU,画面角标显示「SFU·TURN中继」。多一跳、占 TURN 流量,只在直连 SFU 线路差时用
+- **不用 TURN**:只直连 SFU;屏蔽 UDP 的成员可能连不上
 
-直连时角标会标出走的是 IPv4 还是 IPv6(「P2P直连·IPv6」);双方都有公网 IPv6 时通常会优先直连 IPv6。强制中继的注意事项:
-- 全部音视频都经过服务器,按 3 人、1 人共享 3.5Mbps、每天 3.5 小时估算,服务器出站约 **330 GB/月**,留意轻量服务器的月流量包;延迟会比同城直连多十几到几十毫秒
-- 仍是 mesh:共享者上行不变(每个观看者一份),中继只负责转发
-- 每对连接两端各占一个中继端口,8 人满房约需 56 个,所以端口段默认 `49160-49400`(`.env` 的 `TURN_MIN_PORT` / `TURN_MAX_PORT`),安全组 / 宝塔防火墙要同步放行
-- 未配置 TURN(`COTURN_*` / `TURN_KEY_*`)时该开关不可用
+画面角标显示的是**你到 Cloudflare SFU 这条连接**:「SFU·IPv4」/「SFU·IPv6」/「SFU·TURN中继」。未配置 TURN(`COTURN_*` / `TURN_KEY_*`)时「强制」不可选。
 
-### 怎么判断某人是不是走了 relay(以及值不值得自建 coturn)
+## 五、带宽与费用
 
-先用免费的 Cloudflare TURN(方案 A)顶上,别急着为兜底单开机器。是否需要自建,用**数据**决定,别靠猜:
+共享者把屏幕编成三层同时上传给 SFU,**与观看人数无关**:
 
-**看单次连接走没走中继** —— 画面卡的那个人,浏览器地址栏输入 `chrome://webrtc-internals`(共享/观看期间打开),找到对应的 `RTCPeerConnection` → 展开 `candidate-pair (… , succeeded)`(nominated=true 那条)→ 看两端 candidate 的 `candidateType`:
+| 档位 | 原画层 f | 半分辨率层 h | 缩略图层 q | 共享者上行合计 |
+|------|---------|-------------|-----------|--------------|
+| 高清 | 1080p · 3.5 Mbps | 540p · ≤游客档码率 | 360p · 0.3 Mbps | 约 4.6 Mbps |
+| 流畅(默认) | 1080p · 1.5 Mbps | 540p · ≤游客档码率 | 360p · 0.3 Mbps | 约 2.6 Mbps |
 
-| 本地/远端候选类型 | 含义 | 是否吃 TURN 带宽 |
-|------------------|------|-----------------|
-| `host` / `srflx`(server-reflexive) | **P2P 直连打洞成功** | 否,不经过服务器 |
-| 任意一端是 `relay` | **走 TURN 中继**了 | 是 |
+观看者下行 = 自己正在看的那些层之和:主窗口一路原画 + 其余缩略图各 0.3 Mbps。
 
-也可以看画面统计:直连的 `currentRoundTripTime` 通常是本地网络的几~几十 ms;走境外 Cloudflare relay 会明显偏高(往返绕境外)。
+**Cloudflare 费用**:只按 SFU 发给观看者的流量计费,每月前 1000 GB 免费(与 TURN 共用),超出 $0.05/GB。例:3 人、1 人以 3.5 Mbps 共享、每天 3.5 小时 → 约 330 GB/月,免费。
 
-**判断值不值得自建的标准**(满足才考虑上方案 B 自建 coturn):
-
-- 是**固定某几个人**每次都命中 `relay`(而非偶发),说明他们之间 P2P 长期打不通;**并且**
-- 这些人反映境外 relay 的延迟/卡顿实际影响了开黑体验。
-
-只有上面两条同时成立,自建国内 coturn 才划算——把那几对人的中继路径从境外拉回国内。否则维持 Cloudflare 免费兜底即可,零运维。
-
-## 五、带宽要求
-
-每路屏幕限制在 3.5 Mbps。N 人房间中,**正在共享的人**上行 ≈ 3.5 × (N−1) Mbps:
-
-| 房间人数 | 共享者上行需求 |
-|---------|--------------|
-| 3 人 | ~7 Mbps |
-| 5 人 | ~14 Mbps |
-
-100M 及以上家宽(上行普遍 20–40 Mbps)可以从容应对 5 人局。如有人上行偏弱,
-可把 `public/app.js` 顶部的 `SCREEN_MAX_BITRATE` 调低(如 2_500_000)。
-
-房间人数上限在 `src/index.js` 的 `MAX_PEERS` 中设置(默认 8;mesh 架构不建议超过 6 人同时共享)。
+房间人数上限在 `src/index.js` 的 `MAX_PEERS` 中设置(默认 12)。
 
 ## 使用提示
 
 - 共享时在浏览器弹窗中勾选「同时共享系统音频」(整屏)或「共享标签页音频」,朋友就能听到你的游戏声
 - **演讲者视图**:主画面放大显示当前聚焦的一路,右侧胶片栏是其他成员;**单击右侧任意画面/头像 = 切到主画面**,双击 = 全屏
-- **省带宽**:只有你放在主画面的那一路按全码率(~3.5Mbps)传输,右侧缩略图自动降到 ~300kbps。看谁就给谁要高清,不看的自动省流量——发送方对不同观看者独立调码率
+- **省带宽**:只有你放在主画面的那一路收原画层,右侧缩略图自动只收 ~300kbps 的缩略图层,游客观看收半分辨率层。看谁就给谁要高清,不看的自动省流量——由 SFU 按观看者选层,共享者不用为每个人单独编码。画面角标里的 [原画] / [缩略] 显示当前收的是哪一层
 - 游戏建议使用「无边框窗口」模式,方便被浏览器捕获
-- 浏览器要求:Chrome / Edge 桌面版(屏幕采集 + H.264 硬编支持最好)
+- 浏览器要求:共享用 Chrome / Edge 桌面版;观看各主流浏览器均可(含 iOS Safari)
 
 ## 架构
 
 ```
-浏览器 ──(WSS 信令,仅建连时)──► Cloudflare Worker ──► Durable Object
-   │                                                    ├─ Room(每频道一个:信令中转)
-   │                                                    ├─ Auth(单例:账号 / 会话)
-   │                                                    └─ Guild(单例:服务器 / 分类 / 频道 / 角色)
-   └──(音视频,持续)──► 其他成员浏览器(WebRTC P2P 直连,打洞失败走 TURN)
+浏览器 ──(WSS 信令)──► Cloudflare Worker ──► Durable Object
+   │                       │                ├─ Room(每频道一个:成员进出、各人发布了哪些轨道)
+   │                       │                ├─ Auth(单例:账号 / 会话)
+   │                       │                └─ Guild(单例:服务器 / 分类 / 频道 / 角色)
+   │                       └─(/api/sfu/*,持 App Secret)──► Realtime SFU API
+   │
+   ├──(上行 PeerConnection:麦克风 / 屏幕三层 / 摄像头)──► Cloudflare Realtime SFU
+   └──(下行 PeerConnection:按需订阅别人的轨道)◄────────── Cloudflare Realtime SFU
 ```
+
+每人两条连接:上行只发、下行只收;同一条连接上的 SFU 操作串行执行(上一轮 SDP 交换完成才开始下一轮)。
 
 全部 Durable Object 均为 SQLite 存储,Workers 免费计划即可运行。
 
