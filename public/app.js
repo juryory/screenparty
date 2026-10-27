@@ -764,12 +764,40 @@ function camEntries() {
   return [{ kind: 'cam', track: state.camStream.getVideoTracks()[0], init: { sendEncodings: [{ maxBitrate: CAM_MAX_BITRATE }] } }];
 }
 
+// 视频编码偏好(设备设置里可改,存本机):默认 H.264 —— 多数显卡/核显能硬件编码,CPU 占用低、
+// 画质稳;浏览器没有 H.264(或用户选了 VP8)就用 VP8。SFU 原样转发,观看端按发布方的编码解码。
+const VIDEO_CODECS = { h264: 'video/H264', vp8: 'video/VP8' };
+function videoCodecPref() {
+  try {
+    return VIDEO_CODECS[localStorage.getItem('sp-vcodec')] ? localStorage.getItem('sp-vcodec') : 'h264';
+  } catch {
+    return 'h264';
+  }
+}
+function preferVideoCodec(transceiver) {
+  const mime = VIDEO_CODECS[videoCodecPref()].toLowerCase();
+  // 新版 Chrome 对只发送的 transceiver 按「发送能力」校验,旧版按「接收能力」:两种都试
+  for (const caps of [RTCRtpSender.getCapabilities?.('video'), RTCRtpReceiver.getCapabilities?.('video')]) {
+    const codecs = caps?.codecs || [];
+    const preferred = codecs.filter((c) => c.mimeType.toLowerCase() === mime);
+    if (!preferred.length) continue; // 这份能力表里没有该编码
+    // H.264 优先 packetization-mode=1(硬件编码器和 SFU 都最常用的模式)
+    preferred.sort((a, b) => /packetization-mode=1/.test(b.sdpFmtpLine || '') - /packetization-mode=1/.test(a.sdpFmtpLine || ''));
+    try {
+      transceiver.setCodecPreferences([...preferred, ...codecs.filter((c) => !preferred.includes(c))]);
+      return;
+    } catch {}
+  }
+  // 都不支持 / 都被拒:保持浏览器默认(通常 VP8)
+}
+
 // 发布:加 transceiver → 本地 offer → tracks/new → 应用 SFU 的 answer
 function publishTracks(entries) {
   const conn = sfu.pub;
   return conn.run(async () => {
     await conn.ensureSession();
     const added = entries.map((e) => ({ ...e, trackName: nextTrackName(e.kind), transceiver: conn.pc.addTransceiver(e.track, { direction: 'sendonly', ...e.init }) }));
+    for (const a of added) if (a.kind === 'screen' || a.kind === 'cam') preferVideoCodec(a.transceiver);
     await conn.pc.setLocalDescription(await conn.pc.createOffer());
     const res = await conn.call('tracks', {
       sessionDescription: conn.pc.localDescription,
@@ -1445,6 +1473,7 @@ function startStatsLoop() {
           total += kbpsOf('local:' + (s.rid || 'f'), s.bytesSent);
           if (!f || s.rid === 'f') f = s;
         });
+        const codec = f && stats.get(f.codecId)?.mimeType?.replace('video/', '');
         if (f) {
           // 编码受限原因 + 编码器实现:排查"为什么自动降分辨率/画面糊"
           const limit = { bandwidth: ' ·带宽受限', cpu: ' ·CPU受限', other: ' ·受限' }[f.qualityLimitationReason] || '';
@@ -1452,7 +1481,7 @@ function startStatsLoop() {
           const encName = (f.encoderImplementation || '').replace(/^[^(]*\(|\)[^)]*$/g, '').slice(0, 24);
           localTile.querySelector('.tile-stats').textContent =
             `↑ ${f.frameWidth || '?'}×${f.frameHeight || '?'} ` +
-            `${f.framesPerSecond || 0}fps ${total}kbps →SFU${limit}${encName ? ' ' + encName : ''}`;
+            `${f.framesPerSecond || 0}fps ${total}kbps →SFU${limit} ${codec || ''}${encName ? ' ' + encName : ''}`;
         }
       } catch {}
     }
@@ -1881,8 +1910,20 @@ async function openDeviceSettings() {
 
   const micSel = mkSel('audioinput', 'sp_micId', '麦克风');
   const camSel = mkSel('videoinput', 'sp_camId', '摄像头');
+  const codecSel = document.createElement('select');
+  codecSel.className = 'field-input';
+  for (const [val, label] of [['h264', 'H.264(优先硬件编码,推荐)'], ['vp8', 'VP8(软件编码)']]) {
+    const o = document.createElement('option');
+    o.value = val;
+    o.textContent = label;
+    codecSel.appendChild(o);
+  }
+  codecSel.value = videoCodecPref();
+  const codecNote = document.createElement('p');
+  codecNote.className = 'field-note';
+  codecNote.textContent = '共享屏幕 / 摄像头用的编码。共享时自己画面角标会显示实际编码器:含 MediaFoundation / NVENC / VideoToolbox 等即为硬件编码,OpenH264 / libvpx 为软件编码。改后下次开始共享时生效。';
   const body = document.createElement('div');
-  body.append(field('麦克风', micSel), field('摄像头', camSel));
+  body.append(field('麦克风', micSel), field('摄像头', camSel), field('视频编码', codecSel), codecNote);
   if (devices.length && devices.every((d) => !d.label)) {
     const tip = document.createElement('p');
     tip.className = 'confirm-msg';
@@ -1895,6 +1936,7 @@ async function openDeviceSettings() {
     const camChanged = camSel.value !== (localStorage.getItem('sp_camId') || '');
     micSel.value ? localStorage.setItem('sp_micId', micSel.value) : localStorage.removeItem('sp_micId');
     camSel.value ? localStorage.setItem('sp_camId', camSel.value) : localStorage.removeItem('sp_camId');
+    try { localStorage.setItem('sp-vcodec', codecSel.value); } catch {}
     // 正在用的设备热切换:重新采集 + replaceTrack,不断连不重协商
     if (micChanged && state.micTrack) await switchMic();
     if (camChanged && state.camStream) await switchCamera();

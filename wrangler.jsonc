@@ -2,6 +2,8 @@
   "name": "screenparty",
   "main": "src/index.js",
   "compatibility_date": "2026-06-01",
+  // 部署时保留在 dashboard 里手动添加的变量(Secret 本来就会保留;这条让"文本"类型变量也不被清掉)
+  "keep_vars": true,
   "assets": {
     "directory": "./public",
     "binding": "ASSETS"
